@@ -273,6 +273,21 @@ def _extract_signature(source_bytes: bytes, node: Node, lang: str) -> str | None
     return None
 
 
+# Most symbol names are an identifier, or a `::` chain of them where any
+# segment after the first may carry a destructor `~`. The leading segment never
+# does: `~value` in source is a bitwise complement, and the name to find there
+# is `value`.
+#
+# Admitting `~` after a `::` is a matter of cost, not of correctness — the merge
+# below handles destructors either way. It keeps them out of the residual
+# alternation, which a C++ codebase would otherwise fill with one entry per
+# class.
+_NAME_HEAD = r"[A-Za-z_][A-Za-z0-9_]*"
+_NAME_SEG = r"~?[A-Za-z_][A-Za-z0-9_]*"
+_TOKEN_RE = re.compile(rf"{_NAME_HEAD}(?:::{_NAME_SEG})*")
+_TOKENISABLE_RE = re.compile(rf"^{_NAME_HEAD}(?:::{_NAME_SEG})*$")
+
+
 def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     """Return a function mapping a symbol body to the known names it references.
 
@@ -280,14 +295,82 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     several names match at the same spot the longest one wins, and the shorter
     names inside it are not reported. `Widget::~Widget` in a destructor body
     therefore yields the destructor, never a bare `Widget`.
+
+    An alternation of every name expresses that directly, but Python's re
+    engine walks alternatives one by one at each position, so the cost grows
+    with the size of the name set: on a codebase with tens of thousands of
+    symbols it dominates indexing entirely.
+
+    Instead, tokenise the body once and look each token up. Names that do not
+    fit the token shape — operator overloads, templates, anything carrying
+    punctuation — keep an alternation of their own, necessarily a small one.
+    The two sets of candidates are then merged into a single leftmost-longest
+    walk, because running them as independent passes is NOT equivalent: a name
+    the alternation consumes whole would still be reported piecewise by the
+    tokeniser.
     """
-    ordered = sorted(names, key=len, reverse=True)
-    if not ordered:
+    if not names:
         return lambda content: set()
-    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in ordered) + r")\b")
+
+    tokenisable = {n for n in names if _TOKENISABLE_RE.match(n)}
+    residual = sorted(names - tokenisable, key=len, reverse=True)
+    residual_re = (
+        re.compile(r"\b(" + "|".join(re.escape(n) for n in residual) + r")\b")
+        if residual
+        else None
+    )
 
     def match(content: str) -> set[str]:
-        return set(pattern.findall(content))
+        spans: list[tuple[int, int, str]] = []
+
+        for token_match in _TOKEN_RE.finditer(content):
+            token = token_match.group(0)
+            base = token_match.start()
+            if "::" not in token:
+                if token in tokenisable:
+                    spans.append((base, token_match.end(), token))
+                continue
+            # Walk the chain: at each segment take the longest run of segments
+            # that is a known name, then resume after it. A segment start is
+            # always a word boundary, so an inner run can match on its own.
+            segments = token.split("::")
+            offsets = []
+            offset = 0
+            for segment in segments:
+                offsets.append(offset)
+                offset += len(segment) + 2
+            i = 0
+            while i < len(segments):
+                for j in range(len(segments), i, -1):
+                    candidate = "::".join(segments[i:j])
+                    if candidate in tokenisable:
+                        start = base + offsets[i]
+                        spans.append((start, start + len(candidate), candidate))
+                        i = j
+                        break
+                else:
+                    i += 1
+
+        if residual_re is not None:
+            for residual_match in residual_re.finditer(content):
+                spans.append(
+                    (residual_match.start(1), residual_match.end(1), residual_match.group(1))
+                )
+            # Only the merge below can decide between an untokenisable name and
+            # the tokens inside it, so it has to see both.
+            spans.sort(key=lambda span: (span[0], -(span[1] - span[0])))
+            found: set[str] = set()
+            cursor = 0
+            for start, end, name in spans:
+                if start < cursor:
+                    continue
+                found.add(name)
+                cursor = end
+            return found
+
+        # No untokenisable names: the token walk is already leftmost-longest
+        # and non-overlapping, so its spans need no reconciliation.
+        return {name for _, _, name in spans}
 
     return match
 

@@ -44,6 +44,18 @@ _C_QUERY = """
     declarator: (function_declarator
         declarator: (identifier) @fn.name)) @fn.def
 
+; A `T*` return type wraps the declarator in a pointer_declarator, `T**` nests two.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrfn.name))) @ptrfn.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrfn2.name)))) @ptrfn2.def
+
 (struct_specifier
     name: (type_identifier) @struct.name) @struct.def
 
@@ -53,6 +65,17 @@ _C_QUERY = """
 (declaration
     declarator: (function_declarator
         declarator: (identifier) @proto.name)) @proto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrproto.name))) @ptrproto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrproto2.name)))) @ptrproto2.def
 
 (type_definition
     declarator: (type_identifier) @typedef.name) @typedef.def
@@ -72,6 +95,23 @@ _CPP_QUERY = """
 (function_definition
     declarator: (function_declarator
         declarator: (qualified_identifier) @method.name)) @method.def
+
+; A `T*` return type wraps the declarator in a pointer_declarator, `T**` nests two.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrfn.name))) @ptrfn.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrfn2.name)))) @ptrfn2.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (identifier) @ptrproto.name))) @ptrproto.def
 
 (class_specifier
     name: (type_identifier) @cls.name) @cls.def

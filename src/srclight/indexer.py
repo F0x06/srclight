@@ -294,6 +294,10 @@ def _kind_from_capture(capture_name: str) -> str:
         "define": "macro",
         "proto": "prototype",
         "qproto": "prototype",
+        "ptrfn": "function",   # C/C++ pointer return types
+        "ptrfn2": "function",
+        "ptrproto": "prototype",
+        "ptrproto2": "prototype",
         "trait": "trait",
         "impl": "impl",
         "template": "template",

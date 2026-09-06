@@ -142,6 +142,74 @@ def test_index_c(db, c_project):
     assert "main" in names
 
 
+@pytest.fixture
+def pointer_return_project(tmp_path):
+    """A C and a C++ file whose functions return pointers."""
+    src = tmp_path / "ptrproject"
+    src.mkdir()
+
+    (src / "alloc.c").write_text('''\
+typedef struct Node {
+    int value;
+} Node;
+
+Node* node_create(int value);
+Node** node_table(void);
+
+Node* node_create(int value) {
+    return 0;
+}
+
+Node** node_table(void) {
+    return 0;
+}
+
+Node* node_clone(Node* node) {
+    return node_create(node->value);
+}
+''')
+
+    (src / "alloc.cpp").write_text('''\
+struct Buffer {
+    int size;
+};
+
+Buffer* buffer_create(int size);
+
+Buffer* buffer_create(int size) {
+    return new Buffer{size};
+}
+''')
+
+    return src
+
+
+def test_index_pointer_returning_functions(db, pointer_return_project):
+    """Indexes C and C++ functions whose return type is a pointer."""
+    config = IndexConfig(root=pointer_return_project)
+    indexer = Indexer(db, config)
+    indexer.index(pointer_return_project)
+
+    c_syms = db.symbols_in_file("alloc.c")
+    assert {"node_create", "node_table", "node_clone"} <= {
+        s.name for s in c_syms if s.kind == "function"
+    }
+    assert {"node_create", "node_table"} <= {
+        s.name for s in c_syms if s.kind == "prototype"
+    }
+
+    cpp_syms = db.symbols_in_file("alloc.cpp")
+    assert "buffer_create" in {s.name for s in cpp_syms if s.kind == "function"}
+    assert "buffer_create" in {s.name for s in cpp_syms if s.kind == "prototype"}
+
+    # node_clone calls node_create, and both return a pointer. The edge exists
+    # only if both captures mapped to a kind: an unmapped one becomes "unknown",
+    # which EDGE_TARGET_KINDS filters out.
+    node_create = db.get_symbol_by_name("node_create")
+    assert node_create is not None
+    assert "node_clone" in [c["symbol"].name for c in db.get_callers(node_create.id)]
+
+
 def test_incremental_index(db, sample_project):
     """Incremental indexing skips unchanged files."""
     config = IndexConfig(root=sample_project)

@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -270,6 +271,25 @@ def _extract_signature(source_bytes: bytes, node: Node, lang: str) -> str | None
             return source_bytes[node.start_byte:sig_end].decode("utf-8", errors="replace").strip()
 
     return None
+
+
+def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
+    """Return a function mapping a symbol body to the known names it references.
+
+    Matching is leftmost, longest-at-that-position and non-overlapping: where
+    several names match at the same spot the longest one wins, and the shorter
+    names inside it are not reported. `Widget::~Widget` in a destructor body
+    therefore yields the destructor, never a bare `Widget`.
+    """
+    ordered = sorted(names, key=len, reverse=True)
+    if not ordered:
+        return lambda content: set()
+    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in ordered) + r")\b")
+
+    def match(content: str) -> set[str]:
+        return set(pattern.findall(content))
+
+    return match
 
 
 def _kind_from_capture(capture_name: str) -> str:
@@ -1004,15 +1024,9 @@ class Indexer:
             if len(syms) <= MAX_SYMBOL_FANOUT
         }
 
-        # Pre-compile regex
-        sorted_names = sorted(filtered_names.keys(), key=len, reverse=True)
-        if not sorted_names:
+        if not filtered_names:
             return 0
-
-        import re
-        pattern = re.compile(
-            r"\b(" + "|".join(re.escape(n) for n in sorted_names) + r")\b"
-        )
+        match_names = build_name_matcher(set(filtered_names))
 
         def _dir_of(path: str) -> str:
             """Get directory component of a path."""
@@ -1111,7 +1125,7 @@ class Indexer:
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
 
-            referenced_names = set(pattern.findall(content))
+            referenced_names = match_names(content)
             referenced_names.discard(source_name)
 
             imported = _imports_for(source_file, row["language"])

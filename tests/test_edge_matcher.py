@@ -11,6 +11,7 @@ itself — the shapes it covers are the ones the extractor does not produce from
 a small fixture, but which a real C++ codebase does.
 """
 
+import random
 import re
 
 import pytest
@@ -157,9 +158,45 @@ REFERENCE_CASES = [
         id="untokenisable-name-shadows-the-names-inside-it",
     ),
     pytest.param(
+        # `\b` after `=` needs a word character next, so a name ending in
+        # punctuation cannot match before `(`. Both matchers see only the class.
         {"MessageBox", "MessageBox::operator+="},
         "MessageBox::operator+=(other);",
-        id="operator-overload",
+        id="punctuation-terminated-name-cannot-match-before-a-bracket",
+    ),
+    pytest.param(
+        {"MessageBox", "MessageBox::operator+="},
+        "MessageBox::operator+=x;",
+        id="punctuation-terminated-name-matches-before-a-word-character",
+    ),
+    pytest.param(
+        # Accepting the first name must leave the rest of the chain findable.
+        {"Registry<T>::Lookup", "Lookup::Inner", "Inner::Leaf"},
+        "return Registry<T>::Lookup::Inner::Leaf;",
+        id="search-resumes-inside-a-chain-after-a-match",
+    ),
+    pytest.param(
+        {"Foo<T>::bar", "bar::baz", "baz"},
+        "Foo<T>::bar::baz();",
+        id="search-resumes-after-a-template-qualified-name",
+    ),
+    pytest.param(
+        # No boundary before `handler` here, in either case.
+        {"handler"},
+        "cafehandler; 123handler; caféhandler;",
+        id="a-name-inside-a-larger-word-is-not-a-reference",
+    ),
+    pytest.param(
+        {"Widget"},
+        "x = 1Widget;",
+        id="a-name-after-a-digit-is-not-a-reference",
+    ),
+    pytest.param(
+        # The boundary is between `~` and the class, so the bare name matches
+        # even when what precedes `::~` is unknown.
+        {"Widget", "Alias"},
+        "p->Alias::~Widget(); MyWidget::~Widget();",
+        id="explicit-destructor-call-yields-the-class",
     ),
     pytest.param(
         {"Buffer", "Buffer::Inner", "Buffer::Inner::Leaf"},
@@ -177,3 +214,31 @@ REFERENCE_CASES = [
 @pytest.mark.parametrize("names,content", REFERENCE_CASES)
 def test_matcher_agrees_with_reference_alternation(names, content):
     assert build_name_matcher(names)(content) == _reference_matcher(names)(content)
+
+
+def test_matcher_agrees_with_reference_on_random_input():
+    """Fuzz the two against each other.
+
+    The cases above are the shapes that were known to be hard. This looks for
+    the ones that are not: names and bodies are assembled from the same pool of
+    fragments, so collisions, prefixes and partial chains occur often.
+    """
+    rng = random.Random(20240607)
+    fragments = ["Widget", "Registry", "Lookup", "Inner", "handler", "value", "Wid", "handle"]
+    punctuation = ["::", "::~", "<T>::", "(", ")", ";", " ", ".", "->", "~", "1", "é", "_"]
+
+    pieces = fragments + ["::", "<T>::", "::~"]
+    for _ in range(400):
+        names = {
+            "".join(rng.choice(pieces) for _ in range(rng.randint(1, 3)))
+            for _ in range(rng.randint(1, 6))
+        }
+        names = {n for n in names if len(n) >= 4}
+        if not names:
+            continue
+        content = "".join(
+            rng.choice(fragments + punctuation) for _ in range(rng.randint(4, 40))
+        )
+        assert build_name_matcher(names)(content) == _reference_matcher(names)(content), (
+            f"names={names!r} content={content!r}"
+        )

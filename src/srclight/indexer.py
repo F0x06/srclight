@@ -273,19 +273,23 @@ def _extract_signature(source_bytes: bytes, node: Node, lang: str) -> str | None
     return None
 
 
-# Most symbol names are an identifier, or a `::` chain of them where any
-# segment after the first may carry a destructor `~`. The leading segment never
-# does: `~value` in source is a bitwise complement, and the name to find there
-# is `value`.
-#
-# Admitting `~` after a `::` is a matter of cost, not of correctness — the merge
-# below handles destructors either way. It keeps them out of the residual
-# alternation, which a C++ codebase would otherwise fill with one entry per
-# class.
-_NAME_HEAD = r"[A-Za-z_][A-Za-z0-9_]*"
-_NAME_SEG = r"~?[A-Za-z_][A-Za-z0-9_]*"
-_TOKEN_RE = re.compile(rf"{_NAME_HEAD}(?:::{_NAME_SEG})*")
-_TOKENISABLE_RE = re.compile(rf"^{_NAME_HEAD}(?:::{_NAME_SEG})*$")
+# `\b` is Unicode-aware, so a boundary depends on characters this module must
+# not assume are ASCII: `caféhandler` and `123handler` contain no boundary before
+# `handler`, and a scanner that simply looked for identifier runs would report a
+# name that is really part of a larger word.
+_IS_WORD_CHAR = re.compile(r"\w").match
+# Identifier runs, as candidate starting points. The lookbehind is a filter, not
+# the guard: _on_boundary decides, and it is checked again at every candidate.
+# This only keeps positions out of the scan that would be rejected there anyway.
+_IDENT_RUN_RE = re.compile(r"(?<!\w)[A-Za-z_][A-Za-z0-9_]*")
+_LEADING_RUN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _on_boundary(content: str, index: int) -> bool:
+    """`\b` at `index`: exactly one side is a word character."""
+    before = index > 0 and _IS_WORD_CHAR(content[index - 1]) is not None
+    after = index < len(content) and _IS_WORD_CHAR(content[index]) is not None
+    return before != after
 
 
 def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
@@ -297,82 +301,71 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     therefore yields the destructor, never a bare `Widget`.
 
     An alternation of every name expresses that directly, but Python's re
-    engine walks alternatives one by one at each position, so the cost grows
-    with the size of the name set: on a codebase with tens of thousands of
-    symbols it dominates indexing entirely.
+    engine walks alternatives one at a time at each position, so the cost grows
+    with the size of the name set rather than with the body being scanned. On a
+    codebase with tens of thousands of symbols it dominates indexing entirely.
 
-    Instead, tokenise the body once and look each token up. Names that do not
-    fit the token shape — operator overloads, templates, anything carrying
-    punctuation — keep an alternation of their own, necessarily a small one.
-    The two sets of candidates are then merged into a single leftmost-longest
-    walk, because running them as independent passes is NOT equivalent: a name
-    the alternation consumes whole would still be reported piecewise by the
-    tokeniser.
+    So group the names by their leading identifier instead. A name can only
+    begin where an identifier run begins on a boundary, so the run under the
+    cursor selects a handful of candidates by dictionary lookup, and the
+    longest one that the body actually starts with -- and that ends on a
+    boundary -- wins. `Vec<T>::push_back` and `Foo::operator+=` need no special
+    handling: they group under `Vec` and `Foo` like everything else, and the
+    punctuation is just part of the string being compared.
+
+    One scan, one cursor. Splitting the work over several passes and merging
+    the results afterwards is NOT equivalent, however carefully the merge is
+    written: once a match is accepted, the search has to RESUME inside what the
+    other passes had already scanned. `Registry<T>::Lookup::Inner::Leaf` is the
+    case that proves it -- accepting `Registry<T>::Lookup` must leave
+    `Inner::Leaf` still findable.
     """
-    if not names:
-        return lambda content: set()
-
-    tokenisable = {n for n in names if _TOKENISABLE_RE.match(n)}
-    residual = sorted(names - tokenisable, key=len, reverse=True)
-    residual_re = (
-        re.compile(r"\b(" + "|".join(re.escape(n) for n in residual) + r")\b")
-        if residual
-        else None
-    )
+    buckets: dict[str, list[str]] = {}
+    # Names that do not begin with an identifier character (extraction can
+    # produce a few). They cannot be reached from an identifier run, so they
+    # are located directly.
+    unanchored: list[str] = []
+    for name in names:
+        head = _LEADING_RUN_RE.match(name)
+        if head is None:
+            unanchored.append(name)
+        else:
+            buckets.setdefault(head.group(0), []).append(name)
+    for candidates in buckets.values():
+        candidates.sort(key=len, reverse=True)
 
     def match(content: str) -> set[str]:
-        spans: list[tuple[int, int, str]] = []
+        starts: dict[int, list[str]] = {}
+        for run in _IDENT_RUN_RE.finditer(content):
+            candidates = buckets.get(run.group(0))
+            if candidates is not None:
+                starts[run.start()] = candidates
+        for name in unanchored:
+            at = content.find(name)
+            while at != -1:
+                starts.setdefault(at, []).append(name)
+                at = content.find(name, at + 1)
 
-        for token_match in _TOKEN_RE.finditer(content):
-            token = token_match.group(0)
-            base = token_match.start()
-            if "::" not in token:
-                if token in tokenisable:
-                    spans.append((base, token_match.end(), token))
+        found: set[str] = set()
+        cursor = 0
+        for start in sorted(starts):
+            if start < cursor or not _on_boundary(content, start):
                 continue
-            # Walk the chain: at each segment take the longest run of segments
-            # that is a known name, then resume after it. A segment start is
-            # always a word boundary, so an inner run can match on its own.
-            segments = token.split("::")
-            offsets = []
-            offset = 0
-            for segment in segments:
-                offsets.append(offset)
-                offset += len(segment) + 2
-            i = 0
-            while i < len(segments):
-                for j in range(len(segments), i, -1):
-                    candidate = "::".join(segments[i:j])
-                    if candidate in tokenisable:
-                        start = base + offsets[i]
-                        spans.append((start, start + len(candidate), candidate))
-                        i = j
-                        break
-                else:
-                    i += 1
-
-        if residual_re is not None:
-            for residual_match in residual_re.finditer(content):
-                spans.append(
-                    (residual_match.start(1), residual_match.end(1), residual_match.group(1))
-                )
-            # Only the merge below can decide between an untokenisable name and
-            # the tokens inside it, so it has to see both.
-            spans.sort(key=lambda span: (span[0], -(span[1] - span[0])))
-            found: set[str] = set()
-            cursor = 0
-            for start, end, name in spans:
-                if start < cursor:
-                    continue
-                found.add(name)
-                cursor = end
-            return found
-
-        # No untokenisable names: the token walk is already leftmost-longest
-        # and non-overlapping, so its spans need no reconciliation.
-        return {name for _, _, name in spans}
+            candidates = starts[start]
+            if len(candidates) > 1 and unanchored:
+                candidates = sorted(candidates, key=len, reverse=True)
+            for name in candidates:
+                end = start + len(name)
+                if content.startswith(name, start) and _on_boundary(content, end):
+                    found.add(name)
+                    cursor = end
+                    break
+        return found
 
     return match
+
+
+
 
 
 def _kind_from_capture(capture_name: str) -> str:
@@ -1247,7 +1240,6 @@ class Indexer:
         Returns the number of edges created.
         """
         assert self.db.conn is not None
-        import re
 
         # Get all class/struct symbols
         class_rows = self.db.conn.execute(

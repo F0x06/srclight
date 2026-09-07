@@ -216,6 +216,24 @@ def test_matcher_agrees_with_reference_alternation(names, content):
     assert build_name_matcher(names)(content) == _reference_matcher(names)(content)
 
 
+def test_longest_wins_among_names_that_share_a_start_position():
+    """Names unreachable from an identifier run still compete by length.
+
+    Several of them can begin at the same index, and the walk takes the first
+    that matches — so they have to be ordered longest first. Emitted one at a
+    time they inherit whatever order the name set iterated in, which for strings
+    varies between processes, so the wrong one wins at random.
+
+    Every candidate has to END on a boundary too, or the shorter ones are
+    rejected there and the length ordering is never exercised — which is why
+    the names are `::` chains: each one stops in front of a `:` or the `;`.
+    """
+    for depth in range(2, 12):
+        names = {"::seg" * n for n in range(1, depth + 1)}
+        content = "y" + "::seg" * depth + ";"
+        assert build_name_matcher(names)(content) == _reference_matcher(names)(content)
+
+
 def test_matcher_agrees_with_reference_on_random_input():
     """Fuzz the two against each other.
 
@@ -224,11 +242,18 @@ def test_matcher_agrees_with_reference_on_random_input():
     fragments, so collisions, prefixes and partial chains occur often.
     """
     rng = random.Random(20240607)
-    fragments = ["Widget", "Registry", "Lookup", "Inner", "handler", "value", "Wid", "handle"]
-    punctuation = ["::", "::~", "<T>::", "(", ")", ";", " ", ".", "->", "~", "1", "é", "_"]
+    # Non-ASCII and punctuation-leading fragments matter: a name whose first
+    # character is not an ASCII letter cannot be reached from an identifier run,
+    # and several such names can start at the same position — which is where
+    # ordering is easiest to lose.
+    fragments = [
+        "Widget", "Registry", "Lookup", "Inner", "handler", "value", "Wid", "handle",
+        "émetteur", "Ünicode", "envoyer",
+    ]
+    punctuation = ["::", "::~", "<T>::", "(", ")", ";", " ", ".", "->", "~", "1", "é", "_", "&"]
 
-    pieces = fragments + ["::", "<T>::", "::~"]
-    for _ in range(400):
+    pieces = fragments + ["::", "<T>::", "::~", "&", "."]
+    for _ in range(2000):
         names = {
             "".join(rng.choice(pieces) for _ in range(rng.randint(1, 3)))
             for _ in range(rng.randint(1, 6))

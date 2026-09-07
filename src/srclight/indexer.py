@@ -278,11 +278,19 @@ def _extract_signature(source_bytes: bytes, node: Node, lang: str) -> str | None
 # `handler`, and a scanner that simply looked for identifier runs would report a
 # name that is really part of a larger word.
 _IS_WORD_CHAR = re.compile(r"\w").match
-# Identifier runs, as candidate starting points. The lookbehind is a filter, not
-# the guard: _on_boundary decides, and it is checked again at every candidate.
-# This only keeps positions out of the scan that would be rejected there anyway.
-_IDENT_RUN_RE = re.compile(r"(?<!\w)[A-Za-z_][A-Za-z0-9_]*")
-_LEADING_RUN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Identifier runs, as candidate starting points. The classes are Unicode: Python
+# and C# both allow `émetteur` as an identifier, and an ASCII-only head would
+# push every such name off the grouped path and back onto a scan of the whole
+# body, which is the cost this grouping exists to remove. `[^\W\d]` is a word
+# character that is not a digit.
+#
+# The lookbehind IS the guard for these positions, not a filter: the walk does
+# not re-check the leading boundary. A run starts on a word character and the
+# lookbehind refuses a word character before it, so exactly one side is a word
+# character — `\b`, by construction. Relax it and names inside larger words
+# (`123handler`, `caféhandler`) start matching.
+_IDENT_RUN_RE = re.compile(r"(?<!\w)[^\W\d]\w*")
+_LEADING_RUN_RE = re.compile(r"[^\W\d]\w*")
 
 
 def _on_boundary(content: str, index: int) -> bool:
@@ -320,41 +328,76 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     case that proves it -- accepting `Registry<T>::Lookup` must leave
     `Inner::Leaf` still findable.
     """
-    buckets: dict[str, list[str]] = {}
     # Names that do not begin with an identifier character (extraction can
     # produce a few). They cannot be reached from an identifier run, so they
     # are located directly.
     unanchored: list[str] = []
+    grouping: dict[str, list[str]] = {}
     for name in names:
         head = _LEADING_RUN_RE.match(name)
         if head is None:
             unanchored.append(name)
         else:
-            buckets.setdefault(head.group(0), []).append(name)
-    for candidates in buckets.values():
-        candidates.sort(key=len, reverse=True)
+            grouping.setdefault(head.group(0), []).append(name)
+    # Longest first, so the first candidate that matches at a position is the
+    # one the alternation would have chosen. Frozen into tuples: the scan hands
+    # these lists straight to the caller's walk, and a shared list that anything
+    # could append to is a trap waiting for the next change.
+    buckets = {
+        head: tuple(sorted(candidates, key=len, reverse=True))
+        for head, candidates in grouping.items()
+    }
 
-    def match(content: str) -> set[str]:
-        starts: dict[int, list[str]] = {}
+    def anchored_candidates(content: str):
+        """Identifier runs, in order, with the names that could start there.
+
+        The lookbehind in _IDENT_RUN_RE has already established the leading
+        boundary — the run begins on an identifier character and the character
+        before it is not a word character — so the walk need only check where
+        each candidate ENDS.
+        """
         for run in _IDENT_RUN_RE.finditer(content):
-            candidates = buckets.get(run.group(0))
-            if candidates is not None:
-                starts[run.start()] = candidates
+            names_here = buckets.get(run.group(0))
+            if names_here is not None:
+                yield run.start(), names_here
+
+    def all_candidates(content: str):
+        """The same, plus the names that no identifier run can reach.
+
+        Only used when such names exist. They carry no boundary guarantee, so
+        they are filtered here rather than in the walk.
+
+        Several of them can start at the SAME position, and the walk takes the
+        first candidate that matches — so they have to be grouped per position
+        and ordered longest first, exactly as the buckets are. Emitting them one
+        by one left the order to however the name set happened to iterate, and
+        `émetteur` would beat `émetteur.envoyer` about half the time.
+        """
+        by_start: dict[int, list[str]] = {}
         for name in unanchored:
             at = content.find(name)
             while at != -1:
-                starts.setdefault(at, []).append(name)
+                if _on_boundary(content, at):
+                    by_start.setdefault(at, []).append(name)
                 at = content.find(name, at + 1)
+
+        found_at = list(anchored_candidates(content))
+        found_at.extend(
+            (start, tuple(sorted(names_here, key=len, reverse=True)))
+            for start, names_here in by_start.items()
+        )
+        found_at.sort(key=lambda candidate: candidate[0])
+        return found_at
+
+    def match(content: str) -> set[str]:
+        candidates = all_candidates(content) if unanchored else anchored_candidates(content)
 
         found: set[str] = set()
         cursor = 0
-        for start in sorted(starts):
-            if start < cursor or not _on_boundary(content, start):
+        for start, names_here in candidates:
+            if start < cursor:
                 continue
-            candidates = starts[start]
-            if len(candidates) > 1 and unanchored:
-                candidates = sorted(candidates, key=len, reverse=True)
-            for name in candidates:
+            for name in names_here:
                 end = start + len(name)
                 if content.startswith(name, start) and _on_boundary(content, end):
                     found.add(name)
@@ -363,9 +406,6 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
         return found
 
     return match
-
-
-
 
 
 def _kind_from_capture(capture_name: str) -> str:

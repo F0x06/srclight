@@ -1223,7 +1223,7 @@ def list_projects() -> str:
 
 
 @mcp.tool()
-async def reindex(path: str | None = None) -> str:
+async def reindex(path: str | None = None, embed: bool = True) -> str:
     """Trigger re-indexing of the codebase or a specific path.
 
     Incrementally updates the index — only re-parses files whose content
@@ -1231,6 +1231,11 @@ async def reindex(path: str | None = None) -> str:
 
     Args:
         path: Optional specific directory to re-index (default: entire repo)
+        embed: Also refresh embeddings, using the model this index already
+            holds (or SRCLIGHT_EMBED_MODEL). Pass False for a keyword-only
+            refresh when you just need search_symbols current — embedding a
+            large backlog calls the embedding model and can take minutes.
+            Ignored when the index holds no embeddings.
     """
     global _vector_cache
     # `path` is used as an index ROOT, not a filter: Indexer reads the whole
@@ -1262,7 +1267,7 @@ async def reindex(path: str | None = None) -> str:
 
     root = root.resolve()
     db = _get_db()
-    config = IndexConfig(root=root)
+    config = IndexConfig(root=root, disable_embeddings=not embed)
     indexer = Indexer(db, config)
     stats = indexer.index(root)
 

@@ -172,7 +172,7 @@ srclight index                           # embeds with qwen3-embedding
 
 Resolution order is `--embed` > `SRCLIGHT_EMBED_MODEL` > the model stored in
 the index. `--no-embed` skips embeddings entirely for one run, whatever the
-other two say.
+other two say; over MCP, `reindex(embed=False)` does the same.
 
 ### How It Works
 
@@ -411,7 +411,7 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | Tool | What it does |
 |------|-------------|
 | `index_status()` | Index freshness and stats |
-| `reindex()` | Trigger incremental re-index |
+| `reindex(embed=True)` | Trigger incremental re-index; `embed=False` skips the embedding pass |
 | `embedding_health()` | Check if the embedding provider (Ollama, etc.) is reachable |
 | `setup_guide()` | Structured setup instructions for agents and users |
 | `server_stats()` | Server uptime and process info |

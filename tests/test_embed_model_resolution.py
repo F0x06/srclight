@@ -602,6 +602,33 @@ def test_workspace_index_reuses_each_project_model(workspace, embed_calls, monke
     assert embed_calls == ["qwen3-embedding"]
 
 
+def test_workspace_index_can_forget_every_project_model(workspace, embed_calls, monkeypatch):
+    """The off switch must reach a workspace too, not just a single repo.
+
+    Otherwise stopping a metered provider across eight projects means
+    visiting each one by hand.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    db = Database(workspace / ".srclight" / "index.db")
+    db.open()
+    db.remember_embedding_model("qwen3-embedding")
+    db.commit()
+    db.close()
+
+    result = CliRunner().invoke(
+        main, ["workspace", "index", "-w", "embed-ws", "--forget-embed-model"]
+    )
+    assert result.exit_code == 0, result.output
+
+    db = Database(workspace / ".srclight" / "index.db")
+    db.open()
+    try:
+        assert db.detect_embedding_model() is None
+    finally:
+        db.close()
+    assert embed_calls == []
+
+
 def test_workspace_index_honours_no_embed(workspace, embed_calls, monkeypatch):
     """Skipping was asked for explicitly: on eight projects it is minutes."""
     monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)

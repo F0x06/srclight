@@ -117,7 +117,7 @@ DEFAULT_IGNORE = [
 # Max file size to index (1 MB)
 MAX_FILE_SIZE = 1_000_000
 
-# Default embedding model, for every run that does not pass --embed
+# Embedding model for indexes that have none recorded — see resolve_embed_model
 EMBED_MODEL_ENV = "SRCLIGHT_EMBED_MODEL"
 
 
@@ -157,9 +157,10 @@ def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
 
     The environment variable comes LAST on purpose: it is a default for
     indexes that have no model yet, not an override. Ahead of the recorded
-    model, exporting it once — as the README suggests — would make the next
-    commit in an unrelated repo re-embed every symbol it holds, silently,
-    from a detached background hook, against a metered API in the paid case.
+    model, exporting it once — the natural way to set a default — would make
+    the next commit in an unrelated repo re-embed every symbol it holds,
+    silently, from a detached background hook, against a metered API in the
+    paid case.
     Switching an existing index stays an explicit `--embed`.
 
     `disable_embeddings` opts out of all three.

@@ -411,7 +411,11 @@ def workspace_remove(project_name: str, ws_name: str):
 @click.option("--no-embed", is_flag=True, default=False,
               help="Index without embeddings for this run. Changed files still lose "
                    "the embeddings of the symbols they replace.")
-def workspace_index(ws_name: str, project: str | None, embed_model: str | None, no_embed: bool):
+@click.option("--forget-embed-model", is_flag=True, default=False,
+              help="Stop embedding every index in the workspace for good: later runs, "
+                   "git hooks included, leave embeddings alone until --embed is passed again.")
+def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
+                    no_embed: bool, forget_embed_model: bool):
     """Index all (or one) project in a workspace."""
     from .db import Database
     from .indexer import IndexConfig, Indexer, resolve_embed_model
@@ -426,7 +430,9 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None, 
             click.echo(f"Project '{project}' not found in workspace '{ws_name}'", err=True)
             sys.exit(1)
 
-    if embed_model and not no_embed:
+    if no_embed:
+        click.echo("Embeddings: skipped (--no-embed)")
+    elif embed_model:
         click.echo(f"Embedding model: {embed_model}")
 
     for entry in entries:
@@ -445,8 +451,14 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None, 
             db.open()
             db.initialize()
 
+            if forget_embed_model:
+                db.forget_embedding_model()
+                db.commit()
+                click.echo("    Embedding model: forgotten — later runs will not embed")
+
             indexer_config = IndexConfig(
-                root=root, embed_model=embed_model, disable_embeddings=no_embed,
+                root=root, embed_model=embed_model,
+                disable_embeddings=no_embed or forget_embed_model,
             )
             resolved_model = resolve_embed_model(db, indexer_config)
             indexer_config.embed_model = resolved_model  # pin it, see index()

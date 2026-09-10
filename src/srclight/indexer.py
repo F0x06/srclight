@@ -699,9 +699,15 @@ class Indexer:
             stats.symbols_embedded = self._build_embeddings(embed_model)
             if stats.symbols_embedded > 0:
                 logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
-        elif (stats.files_indexed or stats.files_removed) and self.db.has_embeddings():
-            # No embedding pass, but symbols moved under the sidecar's feet.
-            self.db.bump_embedding_cache_version()
+
+        # Symbols moved and nothing was embedded: the sidecar now describes a
+        # database that has changed, and symbols.id is a rowid reused after
+        # deletion, so leaving it valid serves one symbol's score under
+        # another symbol's identity. What matters is that the pass wrote
+        # nothing — not why. A configured model whose provider is down, and a
+        # reindex that only removed files, both land here.
+        if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
+            self._invalidate_sidecar()
 
         # Update index state
         git_head = _get_git_head(root)
@@ -1285,6 +1291,21 @@ class Indexer:
 
         return edge_count
 
+    def _invalidate_sidecar(self) -> None:
+        """Mark the .npy sidecar stale, if this index has one to invalidate.
+
+        Keyed on the sidecar's existence rather than on rows in
+        symbol_embeddings: a reindex that removes every embedded file leaves
+        that table empty while the sidecar still lists the deleted symbols.
+        """
+        from .vector_cache import VectorCache
+
+        try:
+            if VectorCache(self.config.root / ".srclight").sidecar_exists():
+                self.db.bump_embedding_cache_version()
+        except Exception:
+            logger.debug("Could not invalidate the embedding sidecar", exc_info=True)
+
     def _build_embeddings(self, model_spec: str) -> int:
         """Generate embeddings for symbols that need them.
 
@@ -1351,7 +1372,9 @@ class Indexer:
 
             self.db.commit()
         except Exception as e:
-            logger.error("Embedding failed, index left intact: %s", e)
+            # exc_info: this catch also covers upsert/commit, so a programming
+            # error must not be reported as one line reading like an outage.
+            logger.error("Embedding failed, index left intact: %s", e, exc_info=True)
             try:
                 self.db.rollback()
             except Exception:

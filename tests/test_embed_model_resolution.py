@@ -401,6 +401,40 @@ def test_a_skipped_embedding_pass_marks_the_sidecar_stale(repo, stub_provider):
 # --- an embedding pass must never cost the index ---
 
 
+def test_a_failed_embedding_pass_marks_the_sidecar_stale(repo, stub_provider, monkeypatch):
+    """Nothing embedded is nothing embedded, whatever the reason.
+
+    Invalidating only when no model resolved left the ordinary cases out:
+    the provider is down, or the reindex only removed files. The run then
+    reports success while the sidecar describes a database that has moved —
+    and symbols.id is a rowid, reused after deletion, so semantic_search
+    serves one symbol's score under another symbol's identity.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+
+    def version():
+        db = Database(db_path)
+        db.open()
+        try:
+            return db.conn.execute(
+                "SELECT value FROM schema_info WHERE key='embedding_cache_version'"
+            ).fetchone()["value"]
+        finally:
+            db.close()
+
+    before = version()
+    stub_provider["results"] = []  # provider down: every batch failed
+    (repo / "main.py").write_text("def replaced():\n    return 2\n")
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert version() != before, "sidecar still trusted after a pass that embedded nothing"
+
+
 def test_an_unreachable_provider_does_not_lose_the_index(tmp_path, monkeypatch):
     """The whole run used to roll back when the provider was down.
 
@@ -555,6 +589,88 @@ def test_the_server_heals_a_sidecar_another_process_could_not_replace(repo, stub
 
         assert healed is not None
         assert healed.is_valid(server_mod._get_db().conn), "sidecar left stale for the session"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
+def test_a_sidecar_this_process_cannot_replace_is_attempted_once(repo, stub_provider, monkeypatch):
+    """Another long-lived reader can hold the file mapped; do not thrash.
+
+    On failure the old code dropped the cache and returned None, so the next
+    call cold-loaded the intact-but-stale sidecar and the one after that
+    rebuilt again — every other search paying a full matrix build (~440 MB
+    written for a 27K x 4096 index) forever.
+    """
+    from srclight import server as server_mod
+    from srclight.vector_cache import VectorCache
+
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
+    server_mod.configure(db_path=db_path, repo_root=repo)
+    try:
+        assert server_mod._get_vector_cache().is_loaded()
+
+        attempts = []
+        real_build = VectorCache.build_from_db
+
+        def failing_build(self, conn):
+            attempts.append(1)
+            raise PermissionError("[WinError 5] the file is mapped by another process")
+
+        monkeypatch.setattr(VectorCache, "build_from_db", failing_build)
+
+        other = Database(db_path)
+        other.open()
+        sym_id = other.conn.execute("SELECT id FROM symbols LIMIT 1").fetchone()["id"]
+        other.upsert_embedding(sym_id, "stub:stub-model", 3, vector_to_bytes([0.9, 0.9, 0.9]))
+        other.commit()
+        other.close()
+
+        for _ in range(4):
+            server_mod._get_vector_cache()
+
+        assert len(attempts) == 1, f"rebuilt {len(attempts)} times for one stale version"
+        assert real_build is not None  # keep the reference honest
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
+def test_a_rebuild_publishes_a_new_cache_rather_than_reloading_in_place(repo, stub_provider,
+                                                                        monkeypatch):
+    """Rebinding, so nothing observes a half-swapped cache.
+
+    The old object is emptied first — its mmap has to go before os.replace
+    can land on Windows — but it is never refilled in place, so a thread
+    holding it either searches a complete matrix or none at all, and never a
+    matrix whose rows no longer match its symbol_ids.
+    """
+    from srclight import server as server_mod
+
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
+    server_mod.configure(db_path=db_path, repo_root=repo)
+    try:
+        in_flight = server_mod._get_vector_cache()
+        assert in_flight.is_loaded()
+
+        other = Database(db_path)
+        other.open()
+        sym_id = other.conn.execute("SELECT id FROM symbols LIMIT 1").fetchone()["id"]
+        other.upsert_embedding(sym_id, "stub:stub-model", 3, vector_to_bytes([0.9, 0.9, 0.9]))
+        other.commit()
+        other.close()
+
+        rebuilt = server_mod._get_vector_cache()
+
+        assert rebuilt is not in_flight, "rebuilt in place instead of publishing a new cache"
+        assert rebuilt.is_valid(server_mod._get_db().conn)
+        assert not in_flight.is_loaded(), "the old mmap must be dropped, not refilled"
     finally:
         server_mod._close_databases()
         server_mod.configure(db_path=None, repo_root=None)

@@ -367,6 +367,71 @@ def _get_db() -> Database:
     return _db
 
 
+_vector_cache_rebuild_lock = threading.Lock()
+_vector_cache_rebuild_failed_at: int | None = None
+
+
+def _rebuild_vector_cache(db):
+    """Rebuild the stale sidecar and publish the result.
+
+    Sync MCP tools run on anyio worker threads, so two searches can arrive
+    here at once. Rebuilding is not cheap — a 27K x 4096 index is ~440 MB
+    written and ~1.8 GB peak — and VectorCache._atomic_write uses a fixed
+    temp name, so concurrent builders rename it out from under each other
+    and both fail. One at a time, then.
+
+    Our own mapping has to go before the write, or os.replace hits the same
+    WinError 5 the hook did — so the old cache is invalidated in place, and a
+    thread that is already inside search() with a reference to it sees an
+    empty matrix and returns no hits for that one call. Narrow: a caller
+    reaching search() has just passed is_valid(), which is false from the
+    moment the writer bumped the version, so it must have passed it before
+    that commit landed. Closing the window for good means writing the
+    sidecar under a fresh name so the old mapping never blocks the swap —
+    that is vector_cache._atomic_write's design, not this branch's.
+
+    The rebuilt cache is published by rebinding, so nothing ever observes a
+    half-swapped object. A failure is remembered against the database
+    version that provoked it, so a sidecar this process cannot replace —
+    another long-lived reader holding it mapped — costs one attempt, not one
+    per search forever.
+    """
+    global _vector_cache, _vector_cache_rebuild_failed_at
+
+    from .vector_cache import VectorCache
+
+    srclight_dir = _db_path.parent if _db_path else None
+    if srclight_dir is None:
+        return _vector_cache
+
+    with _vector_cache_rebuild_lock:
+        # Another thread may have rebuilt it while we waited.
+        if _vector_cache is not None and _vector_cache.is_valid(db.conn):
+            return _vector_cache
+
+        version = VectorCache._get_db_version(db.conn)
+        if _vector_cache_rebuild_failed_at == version:
+            return _vector_cache
+
+        logger.info("Vector cache sidecar is stale — rebuilding in-process")
+        stale = _vector_cache
+        fresh = VectorCache(srclight_dir)
+        try:
+            if stale is not None:
+                stale.invalidate()  # drop our mmap so os.replace can land
+            fresh.build_from_db(db.conn)
+        except Exception as e:
+            # Keep serving the stale one: every caller re-checks is_valid and
+            # falls back to the SQLite scan, which is slow but correct.
+            logger.warning("Failed to rebuild vector cache sidecar: %s", e)
+            _vector_cache_rebuild_failed_at = version
+            return _vector_cache
+
+        _vector_cache_rebuild_failed_at = None
+        _vector_cache = fresh
+        return _vector_cache
+
+
 def _get_vector_cache():
     """Get or create the VectorCache (single-repo mode)."""
     global _vector_cache
@@ -384,17 +449,10 @@ def _get_vector_cache():
         # embedding_cache_version it just bumped. Nothing else rebuilds it, so
         # every later semantic_search fell back to a full SQLite scan for the
         # life of the server. We hold the mapping, so we are who can refresh
-        # it: drop ours, then rebuild here.
-        if _vector_cache.is_loaded() and not _vector_cache.is_valid(db.conn):
-            logger.info("Vector cache sidecar is stale — rebuilding in-process")
-            _vector_cache.invalidate()
-            try:
-                _vector_cache.build_from_db(db.conn)
-            except Exception as e:
-                logger.warning("Failed to rebuild vector cache sidecar: %s", e)
-                _vector_cache = None
-                return None
-        return _vector_cache
+        # it.
+        if not (_vector_cache.is_loaded() and not _vector_cache.is_valid(db.conn)):
+            return _vector_cache
+        return _rebuild_vector_cache(db)
 
     srclight_dir = _db_path.parent if _db_path else None
     if srclight_dir is None:
@@ -1313,9 +1371,11 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
         "symbols_extracted": stats.symbols_extracted,
         "errors": stats.errors,
         "elapsed_seconds": round(stats.elapsed_seconds, 2),
-        # Say what happened to the embeddings: "skipped" is what you asked
-        # for, but 0 embedded on a model that IS configured means the
-        # provider was unreachable, and semantic_search is now behind.
+        # Say what happened to the embeddings. symbols_embedded 0 with a
+        # model configured is ambiguous on purpose — everything was already
+        # embedded, or the provider could not be reached; the run log
+        # distinguishes them. What it does tell you is that semantic_search
+        # sees nothing new from this run.
         "embeddings": {
             "requested": embed,
             "model": config.embed_model,
@@ -3033,11 +3093,14 @@ def _close_databases() -> None:
 
 def configure(db_path: Path | None = None, repo_root: Path | None = None) -> None:
     """Configure the server for single-repo mode."""
-    global _db_path, _repo_root, _db, _vector_cache
+    global _db_path, _repo_root, _db, _vector_cache, _vector_cache_rebuild_failed_at
     if _db is not None:
         _db.close()
         _db = None
     _vector_cache = None
+    # The failure memo is about one database at one version; pointing the
+    # server somewhere else must not carry it over.
+    _vector_cache_rebuild_failed_at = None
     _db_path = db_path
     _repo_root = repo_root
     _refresh_instructions()

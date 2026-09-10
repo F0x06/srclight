@@ -46,6 +46,7 @@ def _seed_embeddings(db: Database, *models: str) -> None:
 def test_explicit_model_wins_over_env_and_index(db, monkeypatch):
     monkeypatch.setenv("SRCLIGHT_EMBED_MODEL", "voyage-code-3")
     _seed_embeddings(db, "qwen3-embedding")
+    db.remember_embedding_model("qwen3-embedding")
 
     config = IndexConfig(embed_model="embed-v4.0")
 
@@ -58,11 +59,19 @@ def test_env_var_is_used_when_no_model_is_given(db, monkeypatch):
     assert resolve_embed_model(db, IndexConfig()) == "voyage-code-3"
 
 
-def test_env_var_wins_over_the_model_stored_in_the_index(db, monkeypatch):
+def test_the_stored_model_wins_over_the_env_var(db, monkeypatch):
+    """The variable is a default for indexes that have none, not an override.
+
+    Overriding would mean exporting it once — as the README suggests — then
+    having the next commit in an unrelated repo silently re-embed every
+    symbol it holds, from a detached background hook. Switching an existing
+    index stays an explicit --embed.
+    """
     monkeypatch.setenv("SRCLIGHT_EMBED_MODEL", "voyage-code-3")
     _seed_embeddings(db, "qwen3-embedding")
+    db.remember_embedding_model("qwen3-embedding")
 
-    assert resolve_embed_model(db, IndexConfig()) == "voyage-code-3"
+    assert resolve_embed_model(db, IndexConfig()) == "qwen3-embedding"
 
 
 def test_model_stored_in_the_index_is_reused(db, monkeypatch):
@@ -239,6 +248,137 @@ def test_no_embed_skips_the_stored_model(repo, embed_calls, monkeypatch):
     assert embed_calls == []
 
 
+def test_forgetting_the_model_stops_later_runs_from_embedding(repo, stub_provider, monkeypatch):
+    """Sticky needs an exit, and the hooks' command line is fixed.
+
+    The hooks run a bare `srclight index .`, so --no-embed cannot reach them.
+    Without a way to forget, someone who tried `--embed voyage-code-3` once
+    keeps calling a metered API on every commit and every branch switch, with
+    no supported way out but hand-editing SQLite.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    result = CliRunner().invoke(main, ["index", str(repo), "--forget-embed-model"])
+    assert result.exit_code == 0, result.output
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    try:
+        # The rows are still there; they must not resurrect the choice.
+        assert db.embedding_stats()["embedded_symbols"] > 0
+        assert db.detect_embedding_model() is None
+    finally:
+        db.close()
+
+
+def test_a_skipped_embedding_pass_marks_the_sidecar_stale(repo, stub_provider):
+    """--no-embed still deletes and re-creates symbols; ids get reused.
+
+    symbol_embeddings cascades on symbol deletion and the cache version is
+    bumped only by upsert_embedding, so a --no-embed run that changed symbols
+    left a sidecar that still looked valid while describing the previous
+    index — and semantic_search served rows for reused ids, i.e. one symbol's
+    score attached to another symbol's identity.
+    """
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+    db = Database(db_path)
+    db.open()
+    before = db.conn.execute(
+        "SELECT value FROM schema_info WHERE key='embedding_cache_version'"
+    ).fetchone()["value"]
+    db.close()
+
+    (repo / "added.py").write_text("def added():\n    return 3\n")
+    result = CliRunner().invoke(main, ["index", str(repo), "--no-embed"])
+    assert result.exit_code == 0, result.output
+
+    db = Database(db_path)
+    db.open()
+    try:
+        after = db.conn.execute(
+            "SELECT value FROM schema_info WHERE key='embedding_cache_version'"
+        ).fetchone()["value"]
+        assert after != before, "sidecar still looks valid for a changed index"
+    finally:
+        db.close()
+
+
+# --- an embedding pass must never cost the index ---
+
+
+def test_an_unreachable_provider_does_not_lose_the_index(tmp_path, monkeypatch):
+    """The whole run used to roll back when the provider was down.
+
+    embed_symbols swallows per-batch failures and returns [], then
+    provider.dimensions re-probes the provider and raised out of index(),
+    past the single commit that makes the file pass durable. Every
+    post-commit hook on a machine with Ollama stopped indexed nothing.
+    """
+    from srclight import embeddings as embeddings_mod
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "main.py").write_text("def hello():\n    return 1\n")
+
+    class _DeadProvider:
+        name = "ollama:qwen3-embedding"
+
+        @property
+        def dimensions(self):
+            raise ConnectionError("Cannot reach Ollama at http://localhost:11434")
+
+    def dead_embed_symbols(provider, symbols, on_progress=None):
+        return []  # every batch failed, swallowed inside embed_symbols
+
+    monkeypatch.setattr(embeddings_mod, "get_provider", lambda spec, **kw: _DeadProvider())
+    monkeypatch.setattr(embeddings_mod, "embed_symbols", dead_embed_symbols)
+    monkeypatch.setenv("SRCLIGHT_EMBED_MODEL", "qwen3-embedding")
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+    assert result.exit_code == 0, result.output
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    try:
+        assert db.stats()["files"] == 1, "the file pass was rolled back by the embedding failure"
+        assert db.get_index_state(str(repo.resolve())) is not None
+    finally:
+        db.close()
+
+
+def test_the_file_pass_is_durable_before_embedding_starts(repo, stub_provider, monkeypatch):
+    """Embedding can take minutes; it must not hold the write lock.
+
+    index() committed once at the very end, so the implicit transaction
+    opened by the first file upsert stayed open across every HTTP call. A
+    second writer — the git hook firing while an MCP reindex embeds — hit
+    'database is locked' and lost its own run.
+    """
+    from srclight import embeddings as embeddings_mod
+
+    seen = {}
+    (repo / "later.py").write_text("def later():\n    return 2\n")
+
+    def observing_embed_symbols(provider, symbols, on_progress=None):
+        other = Database(repo / ".srclight" / "index.db")
+        other.open()
+        try:
+            seen["files"] = other.stats()["files"]
+        finally:
+            other.close()
+        return [(s["id"], vector_to_bytes([0.1, 0.2, 0.3])) for s in symbols]
+
+    monkeypatch.setattr(embeddings_mod, "embed_symbols", observing_embed_symbols)
+
+    result = CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"])
+    assert result.exit_code == 0, result.output
+
+    assert seen["files"] == 2, "the file pass was still uncommitted while embedding ran"
+
+
 # --- MCP reindex ---
 
 
@@ -281,6 +421,48 @@ def test_reindex_skips_embeddings_when_the_agent_asks(mcp_repo, embed_calls):
     _call(mcp_repo.reindex(embed=False))
 
     assert embed_calls == []
+
+
+def test_the_server_heals_a_sidecar_another_process_could_not_replace(repo, stub_provider):
+    """The git hooks embed from a separate process, and cannot fix the sidecar.
+
+    A running server holds embeddings.npy mmap'd for its whole life, and
+    Windows refuses os.replace on a mapped file — so the hook's rebuild
+    fails, its warning goes to reindex.log, and the sidecar keeps a version
+    the bumped embedding_cache_version no longer matches. Nothing else ever
+    rebuilds it, so semantic_search fell back to a full SQLite scan forever.
+    The server holds the mapping, so the server is who can refresh it.
+    """
+    from srclight import server as server_mod
+
+    result = CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"])
+    assert result.exit_code == 0, result.output
+
+    db_path = repo / ".srclight" / "index.db"
+    server_mod.configure(db_path=db_path, repo_root=repo)
+    try:
+        cache = server_mod._get_vector_cache()
+        assert cache is not None and cache.is_loaded(), "no sidecar to start from"
+
+        # Another process embeds: rows land in SQLite and the cache version is
+        # bumped, but the sidecar on disk stays behind.
+        other = Database(db_path)
+        other.open()
+        try:
+            sym_id = other.conn.execute("SELECT id FROM symbols LIMIT 1").fetchone()["id"]
+            other.upsert_embedding(sym_id, "stub-model", 3, vector_to_bytes([0.9, 0.9, 0.9]))
+            other.commit()
+            assert not cache.is_valid(other.conn), "test did not manage to stale the cache"
+        finally:
+            other.close()
+
+        healed = server_mod._get_vector_cache()
+
+        assert healed is not None
+        assert healed.is_valid(server_mod._get_db().conn), "sidecar left stale for the session"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
 
 
 def test_reindex_releases_the_vector_cache_before_indexing(mcp_repo, embed_calls, monkeypatch):

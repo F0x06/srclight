@@ -79,15 +79,20 @@ def main(verbose: bool):
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option("--db", "db_path", type=click.Path(), help="Database path (default: .srclight/index.db)")
 @click.option("--embed", "embed_model", type=str, default=None,
-              envvar="SRCLIGHT_EMBED_MODEL", show_envvar=True,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). "
-                   "Defaults to the model the index already uses.")
+              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). Passed once: "
+                   "later runs reuse the model recorded in the index, else "
+                   "$SRCLIGHT_EMBED_MODEL.")
 @click.option("--no-embed", is_flag=True, default=False,
-              help="Index without embeddings, ignoring --embed and the stored model")
-def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool):
+              help="Index without embeddings for this run. Changed files still lose "
+                   "the embeddings of the symbols they replace.")
+@click.option("--forget-embed-model", is_flag=True, default=False,
+              help="Stop embedding this index for good: later runs, git hooks included, "
+                   "leave embeddings alone until --embed is passed again.")
+def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool,
+          forget_embed_model: bool):
     """Index a codebase for AI-powered search."""
     from .db import Database
-    from .indexer import IndexConfig, Indexer, resolve_embed_model
+    from .indexer import EMBED_MODEL_ENV, IndexConfig, Indexer, resolve_embed_model
 
     root = Path(path).resolve()
     if not root.is_dir():
@@ -110,16 +115,29 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     db.open()
     db.initialize()
 
-    config = IndexConfig(root=root, embed_model=embed_model, disable_embeddings=no_embed)
+    if forget_embed_model:
+        db.forget_embedding_model()
+        db.commit()
+        click.echo("Embedding model: forgotten — later runs will not embed")
+
+    config = IndexConfig(
+        root=root, embed_model=embed_model,
+        disable_embeddings=no_embed or forget_embed_model,
+    )
     # Resolve once and pin the result: resolving again inside the indexer, after
     # the file pass, can disagree with what we printed here — a checkout that
     # drops every embedded file cascade-deletes its embeddings mid-run.
     resolved_model = resolve_embed_model(db, config)
     config.embed_model = resolved_model
-    if resolved_model and not embed_model:
-        click.echo(f"Embedding model: {resolved_model} (from the existing index)")
-    elif resolved_model:
+    if no_embed:
+        click.echo("Embeddings: skipped (--no-embed)")
+    elif resolved_model and embed_model:
         click.echo(f"Embedding model: {resolved_model}")
+    elif resolved_model:
+        origin = ("from the existing index"
+                  if resolved_model == db.detect_embedding_model()
+                  else f"from ${EMBED_MODEL_ENV}")
+        click.echo(f"Embedding model: {resolved_model} ({origin})")
 
     indexer = Indexer(db, config)
 
@@ -387,11 +405,12 @@ def workspace_remove(project_name: str, ws_name: str):
 @click.option("--workspace", "-w", "ws_name", required=True, help="Workspace to index")
 @click.option("--project", "-p", help="Index only this project (default: all)")
 @click.option("--embed", "embed_model", type=str, default=None,
-              envvar="SRCLIGHT_EMBED_MODEL", show_envvar=True,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). "
-                   "Defaults to the model each index already uses.")
+              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). Passed once: "
+                   "later runs reuse the model recorded in each index, else "
+                   "$SRCLIGHT_EMBED_MODEL.")
 @click.option("--no-embed", is_flag=True, default=False,
-              help="Index without embeddings, ignoring --embed and the stored model")
+              help="Index without embeddings for this run. Changed files still lose "
+                   "the embeddings of the symbols they replace.")
 def workspace_index(ws_name: str, project: str | None, embed_model: str | None, no_embed: bool):
     """Index all (or one) project in a workspace."""
     from .db import Database
@@ -739,6 +758,9 @@ def hook_install(ws_name: str | None):
     - post-checkout: reindex when switching branches
 
     Both run in the background and only re-parse changed files (incremental).
+    On an index that has a recorded embedding model they also refresh
+    embeddings, which calls that model — `srclight index --forget-embed-model`
+    turns that off for a repo.
 
     Without --workspace, installs in the current repo.
     With --workspace, installs across all repos in the workspace.

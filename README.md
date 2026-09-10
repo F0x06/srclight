@@ -152,27 +152,52 @@ srclight workspace index -w myworkspace --embed qwen3-embedding
 
 ### Choosing the Model Once
 
-`--embed` only has to be passed once per index. Every later run reuses the
-model the index already holds — including the flag-less `srclight index .`
-run by the git hooks and by the MCP `reindex` tool, which would otherwise
-leave every symbol added after the first run unembedded.
+`--embed` only has to be passed once per index. The index records the model
+and every later run reuses it — including the flag-less `srclight index .`
+the git hooks run on each commit, and the MCP `reindex` tool. Without that,
+every symbol added after the first run stays unembedded until someone
+remembers the flag.
 
 ```bash
-srclight index --embed qwen3-embedding   # first run: picks the model
-srclight index                           # later runs: reuses qwen3-embedding
+srclight index --embed qwen3-embedding   # first run: records the model
+srclight index                           # later runs: reuse it, no flag
 ```
 
-To set a default across projects — including brand new indexes — export the
-environment variable:
+The recorded name is provider-qualified, so the second run reports
+`Embedding model: ollama:qwen3-embedding (from the existing index)`.
+
+For indexes that have **no** model recorded yet, `SRCLIGHT_EMBED_MODEL`
+supplies one:
 
 ```bash
 export SRCLIGHT_EMBED_MODEL=qwen3-embedding
-srclight index                           # embeds with qwen3-embedding
+srclight index                           # a fresh index embeds with it
 ```
 
-Resolution order is `--embed` > `SRCLIGHT_EMBED_MODEL` > the model stored in
-the index. `--no-embed` skips embeddings entirely for one run, whatever the
-other two say; over MCP, `reindex(embed=False)` does the same.
+Resolution order is `--embed` > the model recorded in the index >
+`SRCLIGHT_EMBED_MODEL`. The variable comes last on purpose: it is a default
+for new indexes, never an override. Ahead of the recorded model, exporting
+it once would make the next commit in an unrelated repo re-embed every
+symbol it holds, silently, from a background hook. Switching an existing
+index stays an explicit `--embed`.
+
+Two escape hatches:
+
+```bash
+srclight index --no-embed             # skip embedding for this run only
+srclight index --forget-embed-model   # stop embedding this index for good
+```
+
+`--forget-embed-model` is the off switch for the hooks, whose command line
+is fixed: after it, commits index without ever calling the embedding model,
+until you pass `--embed` again. Over MCP, `reindex(embed=False)` is the
+per-call equivalent of `--no-embed`.
+
+Note that skipping is not free. Reindexing a changed file drops the
+embeddings of the symbols it replaces, and a skipped pass does not put them
+back — semantic coverage decays on exactly the files being edited. Ask
+`embedding_status()` what an index will do: `configured_model` is the model
+the next flag-less run uses, and null means it will not embed.
 
 ### How It Works
 
@@ -411,7 +436,7 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | Tool | What it does |
 |------|-------------|
 | `index_status()` | Index freshness and stats |
-| `reindex(embed=True)` | Trigger incremental re-index; `embed=False` skips the embedding pass |
+| `reindex(embed=True)` | Trigger incremental re-index; `embed=False` skips the embedding pass (and lets semantic coverage decay) |
 | `embedding_health()` | Check if the embedding provider (Ollama, etc.) is reachable |
 | `setup_guide()` | Structured setup instructions for agents and users |
 | `server_stats()` | Server uptime and process info |
@@ -523,7 +548,7 @@ srclight hook install --workspace myworkspace
 srclight hook uninstall
 ```
 
-The hooks run `srclight index` in the background after each commit and branch switch.
+The hooks run `srclight index` in the background after each commit and branch switch. On a repo whose index has a recorded embedding model, that refreshes embeddings too — see [Choosing the Model Once](#choosing-the-model-once) for the off switch.
 
 ## How It Works
 

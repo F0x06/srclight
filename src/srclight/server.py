@@ -23,7 +23,7 @@ from mcp.server.mcpserver import MCPServer
 
 
 from .db import Database
-from .indexer import IndexConfig, Indexer
+from .indexer import IndexConfig, Indexer, resolve_embed_model
 
 logger = logging.getLogger("srclight.server")
 
@@ -370,12 +370,32 @@ def _get_db() -> Database:
 def _get_vector_cache():
     """Get or create the VectorCache (single-repo mode)."""
     global _vector_cache
-    if _vector_cache is not None:
-        return _vector_cache
 
     from .vector_cache import VectorCache
 
     db = _get_db()
+
+    if _vector_cache is not None:
+        # A flag-less `srclight index` — every git hook run — now embeds, and
+        # it rebuilds the sidecar from its own process. On Windows that
+        # rebuild cannot land: this server holds embeddings.npy mmap'd for its
+        # whole life and os.replace refuses a mapped file, so the hook logs a
+        # warning to reindex.log and leaves a sidecar older than the
+        # embedding_cache_version it just bumped. Nothing else rebuilds it, so
+        # every later semantic_search fell back to a full SQLite scan for the
+        # life of the server. We hold the mapping, so we are who can refresh
+        # it: drop ours, then rebuild here.
+        if _vector_cache.is_loaded() and not _vector_cache.is_valid(db.conn):
+            logger.info("Vector cache sidecar is stale — rebuilding in-process")
+            _vector_cache.invalidate()
+            try:
+                _vector_cache.build_from_db(db.conn)
+            except Exception as e:
+                logger.warning("Failed to rebuild vector cache sidecar: %s", e)
+                _vector_cache = None
+                return None
+        return _vector_cache
+
     srclight_dir = _db_path.parent if _db_path else None
     if srclight_dir is None:
         return None
@@ -1232,11 +1252,14 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
     Args:
         path: Optional specific directory to re-index (default: entire repo)
         embed: Also refresh embeddings, using the model this index already
-            holds (or SRCLIGHT_EMBED_MODEL, which applies even to an index
-            that holds none yet). Pass False for a keyword-only refresh when
-            you just need search_symbols current — embedding a large backlog
-            calls the embedding model and can take minutes. Does nothing when
-            no model is configured or recorded.
+            holds (or SRCLIGHT_EMBED_MODEL for an index that holds none yet).
+            Pass False for a keyword-only refresh when you only need
+            search_symbols current: embedding a large backlog calls the
+            embedding model and can take minutes. Not free, though — a
+            reindex drops the embeddings of every symbol it replaces, and
+            with embed=False nothing puts them back, so semantic_search and
+            hybrid_search lose coverage on exactly the files being edited.
+            Does nothing when no model is configured or recorded.
     """
     global _vector_cache
     # `path` is used as an index ROOT, not a filter: Indexer reads the whole
@@ -1277,6 +1300,9 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
     _vector_cache = None
 
     config = IndexConfig(root=root, disable_embeddings=not embed)
+    # Resolve once and pin, as the CLI does: resolving again after the file
+    # pass can disagree with what we report back to the caller.
+    config.embed_model = resolve_embed_model(db, config)
     indexer = Indexer(db, config)
     stats = indexer.index(root)
 
@@ -1287,6 +1313,14 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
         "symbols_extracted": stats.symbols_extracted,
         "errors": stats.errors,
         "elapsed_seconds": round(stats.elapsed_seconds, 2),
+        # Say what happened to the embeddings: "skipped" is what you asked
+        # for, but 0 embedded on a model that IS configured means the
+        # provider was unreachable, and semantic_search is now behind.
+        "embeddings": {
+            "requested": embed,
+            "model": config.embed_model,
+            "symbols_embedded": stats.symbols_embedded,
+        },
     }
 
     # Send notification to connected clients (MCP logging)
@@ -1649,7 +1683,8 @@ def semantic_search(
     if not emb_stats.get("model"):
         return json.dumps({
             "error": "No embeddings found. Run 'srclight index --embed <model>' first.",
-            "hint": "Try: srclight index --embed qwen3-embedding",
+            "hint": "Try: srclight index --embed qwen3-embedding — once; the index "
+                    "records the model and later runs reuse it",
         })
 
     model_name = emb_stats["model"]
@@ -1791,9 +1826,15 @@ def embedding_status(project: str | None = None) -> str:
     else:
         db = _get_db()
         stats = db.embedding_stats()
+        # stats["model"] comes from an arbitrary embedding row, so after a
+        # model switch it can name the old one. This is the model a flag-less
+        # run — every git hook, and reindex() — will actually use; null means
+        # such a run leaves embeddings alone.
+        stats["configured_model"] = db.detect_embedding_model()
 
     if not stats.get("model"):
-        stats["hint"] = "Run 'srclight index --embed <model>' to generate embeddings"
+        stats["hint"] = ("Run 'srclight index --embed <model>' once to generate embeddings; "
+                         "later runs reuse the model recorded in the index")
 
     return json.dumps(stats, indent=2)
 
@@ -2402,7 +2443,10 @@ async def setup_guide() -> str:
                     "srclight workspace index -w WORKSPACE_NAME",
                     "srclight workspace index -w WORKSPACE_NAME --embed qwen3-embedding",
                 ],
-                "notes": "Ollama on localhost:11434 for qwen3-embedding. Server hot-reloads; no restart needed after indexing.",
+                "notes": "Ollama on localhost:11434 for qwen3-embedding. --embed is passed once: "
+                         "each index records its model and reuses it on every later run, git hooks "
+                         "included (srclight index --forget-embed-model turns that off). Server "
+                         "hot-reloads; no restart needed after indexing.",
             },
             {
                 "step": 3,

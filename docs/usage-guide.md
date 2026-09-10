@@ -193,16 +193,17 @@ The `project` parameter filters to one repo. Omit it to search all.
 2. The `post-commit` hook fires (background, non-blocking)
 3. `srclight index .` runs with `flock` (prevents concurrent re-indexes)
 4. Changed files are re-parsed (tree-sitter), FTS5 indexes updated
-5. Output logged to `.srclight/reindex.log`
+5. Embeddings are refreshed too, if this index has a recorded model
+6. Output logged to `.srclight/reindex.log`
 
-**Note**: The hook does NOT re-embed. FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is always fresh. Semantic search for new/changed symbols requires a manual embed pass (see below).
+**Note**: step 5 is why `--embed` is passed only once. An index that has never embedded stays keyword-only, and `--forget-embed-model` takes an index back to that state. If the embedding provider is unreachable when the hook fires, the run logs a warning and keeps the parse work: FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is never held hostage to the embedding model.
 
 ### What Happens on Branch Switch
 
 1. `git checkout other-branch` triggers `post-checkout` hook
 2. Only fires on branch checkouts (not file checkouts) and only when HEAD changes
 3. Same background `srclight index .` as post-commit
-4. FTS5 indexes updated for all files that differ between branches
+4. FTS5 indexes updated for all files that differ between branches, and embeddings with them when the index has a recorded model
 
 ### Re-Embedding After Significant Changes
 
@@ -222,7 +223,7 @@ srclight workspace index -w myworkspace -p project-name --embed qwen3-embedding
 
 Embedding is incremental — only symbols whose `body_hash` changed get re-embedded. The `.npy` sidecar is rebuilt automatically after embedding.
 
-`--embed` is only needed the first time: an index that already holds embeddings reuses its own model on every later run, so a bare `srclight index` re-embeds too. Set `SRCLIGHT_EMBED_MODEL` to pick a model for indexes that hold none yet, and pass `--no-embed` to skip embedding for a single run.
+`--embed` is only needed the first time: the index records the model and reuses it on every later run, so a bare `srclight index` re-embeds too. `SRCLIGHT_EMBED_MODEL` picks a model for indexes that have none recorded — it is a default, not an override, so it never silently switches a repo that already embeds. `--no-embed` skips embedding for a single run; `--forget-embed-model` stops this index from embedding until `--embed` is passed again.
 
 ### Automating Embedding Refresh with Cron
 

@@ -633,7 +633,108 @@ def test_a_sidecar_this_process_cannot_replace_is_attempted_once(repo, stub_prov
             server_mod._get_vector_cache()
 
         assert len(attempts) == 1, f"rebuilt {len(attempts)} times for one stale version"
+
+        # But a NEW version must be tried: the memo is one attempt per state
+        # of the database, not one per server lifetime.
+        other = Database(db_path)
+        other.open()
+        sym_id = other.conn.execute("SELECT id FROM symbols LIMIT 1").fetchone()["id"]
+        other.upsert_embedding(sym_id, "stub:stub-model", 3, vector_to_bytes([0.5, 0.5, 0.5]))
+        other.commit()
+        other.close()
+
+        for _ in range(2):
+            server_mod._get_vector_cache()
+
+        assert len(attempts) == 2, "a newly stale version was never retried"
         assert real_build is not None  # keep the reference honest
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
+def test_the_fast_path_comes_back_once_the_obstruction_lifts(repo, stub_provider, monkeypatch):
+    """A failed rebuild must not pin the server to the SQLite scan for good.
+
+    The rebuild empties our cache before writing, so on failure the global
+    points at an unloaded object. Treating "not loaded" as terminal meant the
+    server never looked at the disk again — every semantic_search paying the
+    full scan for the life of the process, even after the other reader let go
+    and a perfectly good sidecar was written.
+    """
+    from srclight import server as server_mod
+    from srclight.vector_cache import VectorCache
+
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
+    server_mod.configure(db_path=db_path, repo_root=repo)
+    try:
+        assert server_mod._get_vector_cache().is_loaded()
+
+        real_build = VectorCache.build_from_db
+        blocked = {"on": True}
+
+        def maybe_failing_build(self, conn):
+            if blocked["on"]:
+                raise PermissionError("[WinError 5] mapped by another process")
+            return real_build(self, conn)
+
+        monkeypatch.setattr(VectorCache, "build_from_db", maybe_failing_build)
+
+        # Another process embeds; our rebuild cannot land.
+        (repo / "later.py").write_text("def later():\n    return 2\n")
+        assert CliRunner().invoke(main, ["index", str(repo)]).exit_code == 0
+        server_mod._get_vector_cache()
+
+        # The obstruction lifts and a good sidecar is written from outside.
+        blocked["on"] = False
+        (repo / "third.py").write_text("def third():\n    return 3\n")
+        assert CliRunner().invoke(main, ["index", str(repo)]).exit_code == 0
+
+        cache = server_mod._get_vector_cache()
+
+        assert cache is not None and cache.is_loaded(), "never looked at the disk again"
+        assert cache.is_valid(server_mod._get_db().conn), "stuck on the SQLite scan"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
+def test_an_index_that_loses_every_embedding_recovers_when_they_return(repo, stub_provider,
+                                                                       monkeypatch):
+    """Rebuilding over an empty table publishes nothing loadable.
+
+    build_from_db early-returns when there are no rows, so the "rebuilt"
+    cache has never been loaded. Publishing it as a success left the server
+    holding a dead object, and a later commit that re-embedded was never
+    picked up. Reached by the ordinary hook workflow: delete the last
+    embedded file, commit, and the flag-less run invalidates.
+    """
+    from srclight import server as server_mod
+
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
+    server_mod.configure(db_path=db_path, repo_root=repo)
+    try:
+        assert server_mod._get_vector_cache().is_loaded()
+
+        # The last embedded file goes away: symbol_embeddings cascades empty.
+        (repo / "main.py").unlink()
+        assert CliRunner().invoke(main, ["index", str(repo)]).exit_code == 0
+        server_mod._get_vector_cache()
+
+        # Code comes back and is embedded again.
+        (repo / "back.py").write_text("def back():\n    return 4\n")
+        assert CliRunner().invoke(main, ["index", str(repo)]).exit_code == 0
+
+        cache = server_mod._get_vector_cache()
+
+        assert cache is not None and cache.is_loaded(), "left holding a dead cache"
+        assert cache.is_valid(server_mod._get_db().conn)
     finally:
         server_mod._close_databases()
         server_mod.configure(db_path=None, repo_root=None)

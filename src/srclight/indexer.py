@@ -1644,7 +1644,10 @@ class Indexer:
             if VectorCache(self.config.root / ".srclight").sidecar_exists():
                 self.db.bump_embedding_cache_version()
         except Exception:
-            logger.debug("Could not invalidate the embedding sidecar", exc_info=True)
+            # Not a detail: a sidecar left valid over a changed index serves
+            # one symbol's score under another symbol's identity, because
+            # rowids are reused. Say so at a level people see.
+            logger.warning("Could not invalidate the embedding sidecar", exc_info=True)
 
     def _build_embeddings(self, model_spec: str) -> int:
         """Generate embeddings for symbols that need them.

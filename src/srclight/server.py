@@ -421,11 +421,24 @@ def _rebuild_vector_cache(db):
                 stale.invalidate()  # drop our mmap so os.replace can land
             fresh.build_from_db(db.conn)
         except Exception as e:
-            # Keep serving the stale one: every caller re-checks is_valid and
-            # falls back to the SQLite scan, which is slow but correct.
+            # Our mmap is already gone, so there is nothing left to serve from
+            # memory. Callers re-check is_valid and take the SQLite scan —
+            # slow but correct — and the next call reloads from disk.
             logger.warning("Failed to rebuild vector cache sidecar: %s", e)
             _vector_cache_rebuild_failed_at = version
-            return _vector_cache
+            _vector_cache = None
+            return None
+
+        if not fresh.is_loaded():
+            # build_from_db returns without loading anything when the index
+            # holds no embeddings at all — a reindex that removed the last
+            # embedded file. Publishing that would be publishing a dead
+            # cache; the sidecar still on disk describes deleted symbols, so
+            # leave it invalid and let the scan answer until embeddings
+            # return.
+            _vector_cache_rebuild_failed_at = version
+            _vector_cache = None
+            return None
 
         _vector_cache_rebuild_failed_at = None
         _vector_cache = fresh
@@ -450,9 +463,17 @@ def _get_vector_cache():
         # every later semantic_search fell back to a full SQLite scan for the
         # life of the server. We hold the mapping, so we are who can refresh
         # it.
-        if not (_vector_cache.is_loaded() and not _vector_cache.is_valid(db.conn)):
+        if not _vector_cache.is_loaded():
+            # Empty, not finished: a rebuild dropped our mmap and then could
+            # not write, or there was nothing to build from. Never terminal —
+            # fall through to the cold path and read the disk again, or the
+            # server would serve the SQLite scan for the rest of its life
+            # even once a perfectly good sidecar appears.
+            _vector_cache = None
+        elif not _vector_cache.is_valid(db.conn):
+            return _rebuild_vector_cache(db)
+        else:
             return _vector_cache
-        return _rebuild_vector_cache(db)
 
     srclight_dir = _db_path.parent if _db_path else None
     if srclight_dir is None:

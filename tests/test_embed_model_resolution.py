@@ -1,9 +1,10 @@
 """Tests for embedding model resolution.
 
 The model can come from three places, in decreasing priority: the --embed
-flag, the SRCLIGHT_EMBED_MODEL environment variable, and the model already
-stored in the index. The last one is what keeps embeddings alive across the
-flag-less reindexes run by the git hooks and the MCP server.
+flag, the model recorded in the index, and SRCLIGHT_EMBED_MODEL. The middle
+one is what keeps embeddings alive across the flag-less reindexes run by the
+git hooks and the MCP server; the variable comes last so that exporting it
+never switches an index that already embeds.
 """
 
 import pytest
@@ -13,6 +14,8 @@ from srclight.cli import main
 from srclight.db import Database, FileRecord, SymbolRecord
 from srclight.embeddings import vector_to_bytes
 from srclight.indexer import IndexConfig, Indexer, resolve_embed_model
+
+from .test_workspace import ws_dir  # noqa: F401  (fixture re-export)
 
 
 @pytest.fixture
@@ -119,7 +122,7 @@ def test_an_embedding_run_records_the_model_it_used(repo, stub_provider, monkeyp
     db = Database(repo / ".srclight" / "index.db")
     db.open()
     try:
-        assert db.detect_embedding_model() == "stub-model"
+        assert db.detect_embedding_model() == "stub:stub-model"
     finally:
         db.close()
 
@@ -186,7 +189,11 @@ def stub_provider(monkeypatch):
 
     class _Stub:
         def __init__(self, spec):
-            self.name = spec
+            # Real providers qualify the name they report (OllamaProvider
+            # turns "qwen3-embedding" into "ollama:qwen3-embedding"), and it
+            # is that name which gets recorded and later re-resolved. A stub
+            # echoing the spec back would hide every naming regression.
+            self.name = spec if ":" in spec else f"stub:{spec}"
             self.dimensions = 3
 
     def fake_get_provider(model_spec, **kwargs):
@@ -230,6 +237,71 @@ def test_index_reuses_the_model_stored_in_the_index(repo, embed_calls, monkeypat
     assert embed_calls == ["qwen3-embedding"]
 
 
+def test_switching_the_model_updates_the_record(repo, stub_provider, monkeypatch):
+    """A successful switch must overwrite the record, not leave the old one.
+
+    With the record write ignoring conflicts, `--embed model-b` on a model-a
+    index succeeds, the record stays model-a, and every flag-less hook run
+    after it reverts — re-embedding the new rows back and paying twice.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "model-a"]).exit_code == 0
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "model-b"]).exit_code == 0
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    try:
+        assert db.detect_embedding_model() == "stub:model-b"
+    finally:
+        db.close()
+
+
+def test_the_pin_survives_the_index_losing_its_embeddings_mid_run(repo, embed_calls, monkeypatch):
+    """The CLI announces a model before the file pass, and must honour it.
+
+    Resolving a second time inside the indexer can disagree: a checkout that
+    drops every embedded file cascade-deletes its embeddings during the pass,
+    so the later resolve finds nothing and silently skips embedding — after
+    the CLI has already printed the model it was going to use.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    embedded_file = repo / "main.py"
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    sym_id = db.conn.execute("SELECT id FROM symbols LIMIT 1").fetchone()["id"]
+    db.upsert_embedding(sym_id, "qwen3-embedding", 3, vector_to_bytes([0.1, 0.2, 0.3]))
+    db.commit()
+    db.close()
+
+    # The one embedded file disappears: its symbols, and their embeddings,
+    # go with it during the run that follows.
+    embedded_file.unlink()
+    (repo / "replacement.py").write_text("def replacement():\n    return 2\n")
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert "Embedding model: qwen3-embedding" in result.output
+    assert embed_calls == ["qwen3-embedding"], "announced a model, then embedded with none"
+
+
+def test_index_reports_the_model_it_actually_uses(repo, embed_calls, monkeypatch):
+    """The message and the call must not be able to drift apart."""
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    db.remember_embedding_model("qwen3-embedding")
+    db.commit()
+    db.close()
+
+    result = CliRunner().invoke(main, ["index", str(repo)])
+
+    assert result.exit_code == 0, result.output
+    assert embed_calls == ["qwen3-embedding"]
+    assert "Embedding model: qwen3-embedding (from the existing index)" in result.output
+
+
 def test_index_reads_the_model_from_the_environment(repo, embed_calls, monkeypatch):
     monkeypatch.setenv("SRCLIGHT_EMBED_MODEL", "voyage-code-3")
 
@@ -241,6 +313,11 @@ def test_index_reads_the_model_from_the_environment(repo, embed_calls, monkeypat
 
 def test_no_embed_skips_the_stored_model(repo, embed_calls, monkeypatch):
     monkeypatch.setenv("SRCLIGHT_EMBED_MODEL", "voyage-code-3")
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    db.remember_embedding_model("qwen3-embedding")
+    db.commit()
+    db.close()
 
     result = CliRunner().invoke(main, ["index", str(repo), "--no-embed"])
 
@@ -396,6 +473,9 @@ def mcp_repo(repo, monkeypatch):
     # _get_db() walks up from the CWD — never let a test reach the real index.
     monkeypatch.chdir(repo)
     monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    # test_web.py leaves this set for the rest of the session; reindex must
+    # be exercised in single-repo mode whatever ran before us.
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
 
     db_path = repo / ".srclight" / "index.db"
     db = Database(db_path)
@@ -487,3 +567,53 @@ def test_reindex_releases_the_vector_cache_before_indexing(mcp_repo, embed_calls
     _call(mcp_repo.reindex())
 
     assert seen["cache"] is None, "sidecar still mapped while the embedding pass rewrote it"
+
+
+# --- workspace index ---
+
+
+@pytest.fixture
+def workspace(tmp_path, ws_dir):  # noqa: F811
+    """A workspace holding one already-indexed project."""
+    from srclight.workspace import WorkspaceConfig
+
+    project = tmp_path / "alpha"
+    project.mkdir()
+    (project / "main.py").write_text("def hello():\n    return 1\n")
+    assert CliRunner().invoke(main, ["index", str(project)]).exit_code == 0
+
+    config = WorkspaceConfig(name="embed-ws")
+    config.add_project("alpha", str(project))
+    config.save()
+    return project
+
+
+def test_workspace_index_reuses_each_project_model(workspace, embed_calls, monkeypatch):
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    db = Database(workspace / ".srclight" / "index.db")
+    db.open()
+    db.remember_embedding_model("qwen3-embedding")
+    db.commit()
+    db.close()
+
+    result = CliRunner().invoke(main, ["workspace", "index", "-w", "embed-ws"])
+
+    assert result.exit_code == 0, result.output
+    assert embed_calls == ["qwen3-embedding"]
+
+
+def test_workspace_index_honours_no_embed(workspace, embed_calls, monkeypatch):
+    """Skipping was asked for explicitly: on eight projects it is minutes."""
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    db = Database(workspace / ".srclight" / "index.db")
+    db.open()
+    db.remember_embedding_model("qwen3-embedding")
+    db.commit()
+    db.close()
+
+    result = CliRunner().invoke(
+        main, ["workspace", "index", "-w", "embed-ws", "--embed", "voyage-code-3", "--no-embed"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert embed_calls == []

@@ -691,7 +691,7 @@ class Indexer:
             stats.symbols_embedded = self._build_embeddings(embed_model)
             if stats.symbols_embedded > 0:
                 logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
-        elif stats.files_indexed or stats.files_removed:
+        elif (stats.files_indexed or stats.files_removed) and self.db.has_embeddings():
             # No embedding pass, but symbols moved under the sidecar's feet.
             self.db.bump_embedding_cache_version()
 

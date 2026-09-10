@@ -1336,6 +1336,13 @@ class Database:
         """
         self.remember_embedding_model("")
 
+    def has_embeddings(self) -> bool:
+        """Whether this index holds any embedding at all."""
+        assert self.conn is not None
+        return self.conn.execute(
+            "SELECT 1 FROM symbol_embeddings LIMIT 1"
+        ).fetchone() is not None
+
     def bump_embedding_cache_version(self) -> None:
         """Mark the .npy sidecar stale without touching any embedding.
 

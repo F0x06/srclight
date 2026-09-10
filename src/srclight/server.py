@@ -23,7 +23,7 @@ from mcp.server.mcpserver import MCPServer
 
 
 from .db import Database
-from .indexer import IndexConfig, Indexer
+from .indexer import IndexConfig, Indexer, resolve_embed_model
 
 logger = logging.getLogger("srclight.server")
 
@@ -367,15 +367,129 @@ def _get_db() -> Database:
     return _db
 
 
+_vector_cache_rebuild_lock = threading.Lock()
+_vector_cache_rebuild_failed_at: int | None = None
+# True from the moment a rebuild releases our mmap until it has finished.
+# Read without the lock on purpose: a reader must not queue behind a
+# multi-second build just to learn it should not touch the file.
+_vector_cache_rebuilding = False
+
+
+def _rebuild_vector_cache(db):
+    """Rebuild the stale sidecar and publish the result.
+
+    Sync MCP tools run on anyio worker threads, so two searches can arrive
+    here at once. Rebuilding is not cheap — a 27K x 4096 index is ~440 MB
+    written and ~1.8 GB peak — and VectorCache._atomic_write uses a fixed
+    temp name, so concurrent builders rename it out from under each other
+    and both fail. One at a time, then.
+
+    Our own mapping has to go before the write, or os.replace hits the same
+    WinError 5 the hook did — so the old cache is invalidated in place, and a
+    thread that is already inside search() with a reference to it sees an
+    empty matrix and returns no hits for that one call. Narrow: a caller
+    reaching search() has just passed is_valid(), which is false from the
+    moment the writer bumped the version, so it must have passed it before
+    that commit landed. Closing the window for good means writing the
+    sidecar under a fresh name so the old mapping never blocks the swap —
+    that is vector_cache._atomic_write's design, not this branch's.
+
+    The rebuilt cache is published by rebinding, so nothing ever observes a
+    half-swapped object. A failure is remembered against the database
+    version that provoked it, so a sidecar this process cannot replace —
+    another long-lived reader holding it mapped — costs one attempt, not one
+    per search forever.
+    """
+    global _vector_cache, _vector_cache_rebuild_failed_at, _vector_cache_rebuilding
+
+    from .vector_cache import VectorCache
+
+    srclight_dir = _db_path.parent if _db_path else None
+    if srclight_dir is None:
+        return _vector_cache
+
+    with _vector_cache_rebuild_lock:
+        # Another thread may have rebuilt it while we waited.
+        if _vector_cache is not None and _vector_cache.is_valid(db.conn):
+            return _vector_cache
+
+        version = VectorCache._get_db_version(db.conn)
+        if _vector_cache_rebuild_failed_at == version:
+            return _vector_cache
+
+        logger.info("Vector cache sidecar is stale — rebuilding in-process")
+        stale = _vector_cache
+        fresh = VectorCache(srclight_dir)
+        try:
+            # Announce before releasing: from here to the end of the build,
+            # a reader finding an unloaded cache must leave the file alone
+            # rather than mapping it again — see _get_vector_cache.
+            _vector_cache_rebuilding = True
+            if stale is not None:
+                stale.invalidate()  # drop our mmap so os.replace can land
+            fresh.build_from_db(db.conn)
+        except Exception as e:
+            # Our mmap is already gone, so there is nothing left to serve from
+            # memory. Callers re-check is_valid and take the SQLite scan —
+            # slow but correct — and the next call reloads from disk.
+            logger.warning("Failed to rebuild vector cache sidecar: %s", e)
+            _vector_cache_rebuild_failed_at = version
+            _vector_cache = None
+            return None
+        finally:
+            _vector_cache_rebuilding = False
+
+        if not fresh.is_loaded():
+            # build_from_db returns without loading anything when the index
+            # holds no embeddings at all — a reindex that removed the last
+            # embedded file. Publishing that would be publishing a dead
+            # cache; the sidecar still on disk describes deleted symbols, so
+            # leave it invalid and let the scan answer until embeddings
+            # return.
+            _vector_cache_rebuild_failed_at = version
+            _vector_cache = None
+            return None
+
+        _vector_cache_rebuild_failed_at = None
+        _vector_cache = fresh
+        return _vector_cache
+
+
 def _get_vector_cache():
     """Get or create the VectorCache (single-repo mode)."""
     global _vector_cache
-    if _vector_cache is not None:
-        return _vector_cache
 
     from .vector_cache import VectorCache
 
     db = _get_db()
+
+    if _vector_cache is not None:
+        # A flag-less `srclight index` — every git hook run — now embeds, and
+        # it rebuilds the sidecar from its own process. On Windows that
+        # rebuild cannot land: this server holds embeddings.npy mmap'd for its
+        # whole life and os.replace refuses a mapped file, so the hook logs a
+        # warning to reindex.log and leaves a sidecar older than the
+        # embedding_cache_version it just bumped. Nothing else rebuilds it, so
+        # every later semantic_search fell back to a full SQLite scan for the
+        # life of the server. We hold the mapping, so we are who can refresh
+        # it.
+        if not _vector_cache.is_loaded():
+            if _vector_cache_rebuilding:
+                # A rebuild released this mapping deliberately and is about to
+                # replace the file. Re-reading it now is what makes os.replace
+                # fail on Windows, so take the SQLite scan for this one call.
+                return _vector_cache
+            # Empty and nobody is rebuilding: a rebuild dropped our mmap and
+            # then could not write, or there was nothing to build from. Never
+            # terminal — fall through to the cold path and read the disk
+            # again, or the server would serve the SQLite scan for the rest of
+            # its life even once a perfectly good sidecar appears.
+            _vector_cache = None
+        elif not _vector_cache.is_valid(db.conn):
+            return _rebuild_vector_cache(db)
+        else:
+            return _vector_cache
+
     srclight_dir = _db_path.parent if _db_path else None
     if srclight_dir is None:
         return None
@@ -1223,7 +1337,7 @@ def list_projects() -> str:
 
 
 @mcp.tool()
-async def reindex(path: str | None = None) -> str:
+async def reindex(path: str | None = None, embed: bool = True) -> str:
     """Trigger re-indexing of the codebase or a specific path.
 
     Incrementally updates the index — only re-parses files whose content
@@ -1231,6 +1345,15 @@ async def reindex(path: str | None = None) -> str:
 
     Args:
         path: Optional specific directory to re-index (default: entire repo)
+        embed: Also refresh embeddings, using the model this index already
+            holds (or SRCLIGHT_EMBED_MODEL for an index that holds none yet).
+            Pass False for a keyword-only refresh when you only need
+            search_symbols current: embedding a large backlog calls the
+            embedding model and can take minutes. Not free, though — a
+            reindex drops the embeddings of every symbol it replaces, and
+            with embed=False nothing puts them back, so semantic_search and
+            hybrid_search lose coverage on exactly the files being edited.
+            Does nothing when no model is configured or recorded.
     """
     global _vector_cache
     # `path` is used as an index ROOT, not a filter: Indexer reads the whole
@@ -1262,12 +1385,20 @@ async def reindex(path: str | None = None) -> str:
 
     root = root.resolve()
     db = _get_db()
-    config = IndexConfig(root=root)
+    # Release the vector cache BEFORE indexing, not after: the embedding pass
+    # rewrites embeddings.npy through os.replace, which fails on Windows while
+    # this process still holds the old file mmap'd (np.load(mmap_mode="r")).
+    # _build_embeddings swallows that failure, leaving a sidecar whose version
+    # no longer matches the bumped embedding_cache_version — every later
+    # semantic_search then falls back to a full SQLite scan.
+    _vector_cache = None
+
+    config = IndexConfig(root=root, disable_embeddings=not embed)
+    # Resolve once and pin, as the CLI does: resolving again after the file
+    # pass can disagree with what we report back to the caller.
+    config.embed_model = resolve_embed_model(db, config)
     indexer = Indexer(db, config)
     stats = indexer.index(root)
-
-    # Invalidate vector cache so next query reloads from fresh sidecar
-    _vector_cache = None
 
     result = {
         "files_indexed": stats.files_indexed,
@@ -1276,6 +1407,16 @@ async def reindex(path: str | None = None) -> str:
         "symbols_extracted": stats.symbols_extracted,
         "errors": stats.errors,
         "elapsed_seconds": round(stats.elapsed_seconds, 2),
+        # Say what happened to the embeddings. symbols_embedded 0 with a
+        # model configured is ambiguous on purpose — everything was already
+        # embedded, or the provider could not be reached; the run log
+        # distinguishes them. What it does tell you is that semantic_search
+        # sees nothing new from this run.
+        "embeddings": {
+            "requested": embed,
+            "model": config.embed_model,
+            "symbols_embedded": stats.symbols_embedded,
+        },
     }
 
     # Send notification to connected clients (MCP logging)
@@ -1771,6 +1912,13 @@ def embedding_status(project: str | None = None) -> str:
     Shows how many symbols have embeddings, which model was used,
     and the coverage percentage.
 
+    In single-repo mode the result also carries `configured_model`: the model
+    the next flag-less run (a git hook, or reindex()) will actually use, null
+    meaning it will not embed. `model` differs — it names a model already
+    present in the rows, which after a switch can be one no run will use
+    again. Workspace mode does not report `configured_model`: each project
+    records its own, and they need not agree.
+
     Args:
         project: Project name (workspace mode) or uses current repo
     """
@@ -1780,6 +1928,13 @@ def embedding_status(project: str | None = None) -> str:
     else:
         db = _get_db()
         stats = db.embedding_stats()
+        # stats["model"] comes from an arbitrary embedding row, so after a
+        # model switch it can name the old one. This is the model a flag-less
+        # run — every git hook, and reindex() — will actually use; null means
+        # such a run leaves embeddings alone. Resolved, not just read back:
+        # SRCLIGHT_EMBED_MODEL is the third leg of the same chain, and an
+        # index with no record still embeds when it is exported.
+        stats["configured_model"] = resolve_embed_model(db, IndexConfig())
 
     if not stats.get("model"):
         stats["hint"] = "Run 'srclight index --embed <model>' to generate embeddings"
@@ -2391,7 +2546,10 @@ async def setup_guide() -> str:
                     "srclight workspace index -w WORKSPACE_NAME",
                     "srclight workspace index -w WORKSPACE_NAME --embed qwen3-embedding",
                 ],
-                "notes": "Ollama on localhost:11434 for qwen3-embedding. Server hot-reloads; no restart needed after indexing.",
+                "notes": "Ollama on localhost:11434 for qwen3-embedding. --embed is passed once: "
+                         "each index records its model and reuses it on every later run, git hooks "
+                         "included (srclight index --forget-embed-model turns that off). Server "
+                         "hot-reloads; no restart needed after indexing.",
             },
             {
                 "step": 3,
@@ -2971,11 +3129,14 @@ def _close_databases() -> None:
 
 def configure(db_path: Path | None = None, repo_root: Path | None = None) -> None:
     """Configure the server for single-repo mode."""
-    global _db_path, _repo_root, _db, _vector_cache
+    global _db_path, _repo_root, _db, _vector_cache, _vector_cache_rebuild_failed_at
     if _db is not None:
         _db.close()
         _db = None
     _vector_cache = None
+    # The failure memo is about one database at one version; pointing the
+    # server somewhere else must not carry it over.
+    _vector_cache_rebuild_failed_at = None
     _db_path = db_path
     _repo_root = repo_root
     _refresh_instructions()

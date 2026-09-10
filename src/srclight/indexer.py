@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -117,6 +118,9 @@ DEFAULT_IGNORE = [
 # Max file size to index (1 MB)
 MAX_FILE_SIZE = 1_000_000
 
+# Embedding model for indexes that have none recorded — see resolve_embed_model
+EMBED_MODEL_ENV = "SRCLIGHT_EMBED_MODEL"
+
 
 @dataclass
 class IndexStats:
@@ -128,6 +132,7 @@ class IndexStats:
     symbols_extracted: int = 0
     edges_created: int = 0
     errors: int = 0
+    symbols_embedded: int = 0
     elapsed_seconds: float = 0.0
 
 
@@ -139,6 +144,47 @@ class IndexConfig:
     max_doc_file_size: int = 50_000_000  # 50 MB for documents (PDF, DOCX, etc.)
     languages: list[str] | None = None  # None = all supported
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
+    disable_embeddings: bool = False  # --no-embed: index without touching embeddings
+
+
+def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
+    """Pick the embedding model for a run.
+
+    Priority: the explicit model (--embed) > the model the index already
+    holds > SRCLIGHT_EMBED_MODEL. The middle one is what keeps embeddings
+    alive across the flag-less reindexes run by the git hooks and the MCP
+    server — without it, every symbol added after the first `--embed` run
+    stays unembedded.
+
+    The environment variable comes LAST on purpose: it is a default for
+    indexes that have no model yet, not an override. Ahead of the recorded
+    model, exporting it once — the natural way to set a default — would make
+    the next commit in an unrelated repo re-embed every symbol it holds,
+    silently, from a detached background hook, against a metered API in the
+    paid case.
+    Switching an existing index stays an explicit `--embed`.
+
+    `disable_embeddings` opts out of all three.
+    """
+    if config.disable_embeddings:
+        return None
+
+    explicit = (config.embed_model or "").strip()
+    if explicit:
+        return explicit
+
+    recorded = db.detect_embedding_model()
+    if recorded:
+        return recorded
+
+    # An index told to forget stays off, whatever the environment says. The
+    # docs send users to export the variable and the hooks inherit it, so
+    # letting it win here would leave the one person who most needs the off
+    # switch — the one paying a metered provider on every commit — without one.
+    if db.embedding_model_forgotten():
+        return None
+
+    return os.environ.get(EMBED_MODEL_ENV, "").strip() or None
 
 
 def _should_ignore(path: Path, root: Path, patterns: list[str]) -> bool:
@@ -976,11 +1022,29 @@ class Indexer:
             except Exception:
                 logger.warning("Community detection failed", exc_info=True)
 
-        # Build embeddings (optional, only if embed_model configured)
-        if self.config.embed_model:
-            n_embedded = self._build_embeddings(self.config.embed_model)
-            if n_embedded > 0:
-                logger.info("Embedded %d symbols with %s", n_embedded, self.config.embed_model)
+        # Make the file pass durable BEFORE embedding. index() otherwise runs
+        # as one transaction opened at the first file upsert, so the embedding
+        # pass — minutes of HTTP calls — held the write lock the whole time and
+        # took the parse work down with it if it failed. A second writer (the
+        # git hook firing while the MCP server embeds) got 'database is locked'
+        # and lost its own run: no busy_timeout is set.
+        self.db.commit()
+
+        # Build embeddings (optional, only if a model is configured or known)
+        embed_model = resolve_embed_model(self.db, self.config)
+        if embed_model:
+            stats.symbols_embedded = self._build_embeddings(embed_model)
+            if stats.symbols_embedded > 0:
+                logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
+
+        # Symbols moved and nothing was embedded: the sidecar now describes a
+        # database that has changed, and symbols.id is a rowid reused after
+        # deletion, so leaving it valid serves one symbol's score under
+        # another symbol's identity. What matters is that the pass wrote
+        # nothing — not why. A configured model whose provider is down, and a
+        # reindex that only removed files, both land here.
+        if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
+            self._invalidate_sidecar()
 
         # Update index state
         git_head = _get_git_head(root)
@@ -1567,6 +1631,24 @@ class Indexer:
 
         return edge_count
 
+    def _invalidate_sidecar(self) -> None:
+        """Mark the .npy sidecar stale, if this index has one to invalidate.
+
+        Keyed on the sidecar's existence rather than on rows in
+        symbol_embeddings: a reindex that removes every embedded file leaves
+        that table empty while the sidecar still lists the deleted symbols.
+        """
+        from .vector_cache import VectorCache
+
+        try:
+            if VectorCache(self.config.root / ".srclight").sidecar_exists():
+                self.db.bump_embedding_cache_version()
+        except Exception:
+            # Not a detail: a sidecar left valid over a changed index serves
+            # one symbol's score under another symbol's identity, because
+            # rowids are reused. Say so at a level people see.
+            logger.warning("Could not invalidate the embedding sidecar", exc_info=True)
+
     def _build_embeddings(self, model_spec: str) -> int:
         """Generate embeddings for symbols that need them.
 
@@ -1600,21 +1682,47 @@ class Indexer:
             logger.info("  Embedding batch %d/%d (%.0fs elapsed, ~%.0fs remaining)",
                         batch_num, total, elapsed, remaining)
 
+        # Nothing below may escape this method. Embedding is a best-effort
+        # extra: the index itself is already committed, and every caller —
+        # the CLI, the MCP reindex tool, and above all the git hooks, which
+        # run flag-less on every commit — must survive a provider that is
+        # down, slow, or serving a model that does not exist.
         try:
             results = embed_symbols(provider, symbols, on_progress=_on_progress)
-        except ConnectionError as e:
-            logger.error("Embedding failed: %s", e)
+
+            if not results:
+                # embed_symbols swallows per-batch failures and returns [], so
+                # an empty list means the provider is unreachable as often as
+                # it means there was nothing to do. Stop here either way:
+                # provider.dimensions would re-probe the network and raise.
+                logger.warning("Embedded no symbols with %s — provider unreachable?",
+                               provider.name)
+                return 0
+
+            # Remember what actually embedded, so the next flag-less run
+            # continues with it. Recorded only on success: a typo'd model must
+            # not become the index's choice, and a switch that failed part way
+            # through must not be reverted by the old model's row count.
+            self.db.remember_embedding_model(provider.name)
+
+            # Store embeddings
+            dims = provider.dimensions
+            for symbol_id, emb_bytes in results:
+                # Find body_hash from the symbols list
+                sym = next((s for s in symbols if s["id"] == symbol_id), None)
+                body_hash = sym["body_hash"] if sym else None
+                self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes, body_hash)
+
+            self.db.commit()
+        except Exception as e:
+            # exc_info: this catch also covers upsert/commit, so a programming
+            # error must not be reported as one line reading like an outage.
+            logger.error("Embedding failed, index left intact: %s", e, exc_info=True)
+            try:
+                self.db.rollback()
+            except Exception:
+                logger.debug("Rollback after embedding failure failed", exc_info=True)
             return 0
-
-        # Store embeddings
-        dims = provider.dimensions
-        for symbol_id, emb_bytes in results:
-            # Find body_hash from the symbols list
-            sym = next((s for s in symbols if s["id"] == symbol_id), None)
-            body_hash = sym["body_hash"] if sym else None
-            self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes, body_hash)
-
-        self.db.commit()
 
         # Build .npy sidecar for GPU-resident vector cache
         if results:

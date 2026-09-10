@@ -1319,6 +1319,19 @@ class Database:
             })
         return results
 
+    def detect_embedding_model(self) -> str | None:
+        """The embedding model this index was built with, if any.
+
+        An index can hold rows from several models (the user switched); the
+        one covering the most symbols is the one worth continuing with.
+        """
+        assert self.conn is not None
+        row = self.conn.execute(
+            """SELECT model, COUNT(*) AS n FROM symbol_embeddings
+               GROUP BY model ORDER BY n DESC, model ASC LIMIT 1"""
+        ).fetchone()
+        return row["model"] if row else None
+
     def embedding_stats(self) -> dict:
         """Get embedding statistics."""
         assert self.conn is not None

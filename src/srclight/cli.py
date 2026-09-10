@@ -79,11 +79,15 @@ def main(verbose: bool):
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option("--db", "db_path", type=click.Path(), help="Database path (default: .srclight/index.db)")
 @click.option("--embed", "embed_model", type=str, default=None,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3)")
-def index(path: str, db_path: str | None, embed_model: str | None):
+              envvar="SRCLIGHT_EMBED_MODEL", show_envvar=True,
+              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). "
+                   "Defaults to the model the index already uses.")
+@click.option("--no-embed", is_flag=True, default=False,
+              help="Index without embeddings, ignoring --embed and the stored model")
+def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool):
     """Index a codebase for AI-powered search."""
     from .db import Database
-    from .indexer import IndexConfig, Indexer
+    from .indexer import IndexConfig, Indexer, resolve_embed_model
 
     root = Path(path).resolve()
     if not root.is_dir():
@@ -101,14 +105,18 @@ def index(path: str, db_path: str | None, embed_model: str | None):
 
     click.echo(f"Indexing {root}")
     click.echo(f"Database: {db_file}")
-    if embed_model:
-        click.echo(f"Embedding model: {embed_model}")
 
     db = Database(db_file)
     db.open()
     db.initialize()
 
-    config = IndexConfig(root=root, embed_model=embed_model)
+    config = IndexConfig(root=root, embed_model=embed_model, disable_embeddings=no_embed)
+    resolved_model = resolve_embed_model(db, config)
+    if resolved_model and not embed_model:
+        click.echo(f"Embedding model: {resolved_model} (from the existing index)")
+    elif resolved_model:
+        click.echo(f"Embedding model: {resolved_model}")
+
     indexer = Indexer(db, config)
 
     def on_progress(file: str, current: int, total: int):
@@ -130,7 +138,7 @@ def index(path: str, db_path: str | None, embed_model: str | None):
     db_stats = db.stats()
     click.echo(f"  Database size:   {db_stats['db_size_mb']} MB")
 
-    if embed_model:
+    if resolved_model:
         emb_stats = db.embedding_stats()
         click.echo(f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
                     f" ({emb_stats['coverage_pct']}%)")
@@ -375,11 +383,15 @@ def workspace_remove(project_name: str, ws_name: str):
 @click.option("--workspace", "-w", "ws_name", required=True, help="Workspace to index")
 @click.option("--project", "-p", help="Index only this project (default: all)")
 @click.option("--embed", "embed_model", type=str, default=None,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3)")
-def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
+              envvar="SRCLIGHT_EMBED_MODEL", show_envvar=True,
+              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). "
+                   "Defaults to the model each index already uses.")
+@click.option("--no-embed", is_flag=True, default=False,
+              help="Index without embeddings, ignoring --embed and the stored model")
+def workspace_index(ws_name: str, project: str | None, embed_model: str | None, no_embed: bool):
     """Index all (or one) project in a workspace."""
     from .db import Database
-    from .indexer import IndexConfig, Indexer
+    from .indexer import IndexConfig, Indexer, resolve_embed_model
     from .workspace import WorkspaceConfig
 
     config = WorkspaceConfig.load(ws_name)
@@ -391,7 +403,7 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
             click.echo(f"Project '{project}' not found in workspace '{ws_name}'", err=True)
             sys.exit(1)
 
-    if embed_model:
+    if embed_model and not no_embed:
         click.echo(f"Embedding model: {embed_model}")
 
     for entry in entries:
@@ -410,7 +422,12 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
             db.open()
             db.initialize()
 
-            indexer_config = IndexConfig(root=root, embed_model=embed_model)
+            indexer_config = IndexConfig(
+                root=root, embed_model=embed_model, disable_embeddings=no_embed,
+            )
+            resolved_model = resolve_embed_model(db, indexer_config)
+            if resolved_model and not embed_model:
+                click.echo(f"    Embedding model: {resolved_model} (from the existing index)")
             indexer = Indexer(db, indexer_config)
 
             def on_progress(file: str, current: int, total: int):

@@ -150,6 +150,30 @@ srclight index --embed qwen3-embedding
 srclight workspace index -w myworkspace --embed qwen3-embedding
 ```
 
+### Choosing the Model Once
+
+`--embed` only has to be passed once per index. Every later run reuses the
+model the index already holds — including the flag-less `srclight index .`
+run by the git hooks and by the MCP `reindex` tool, which would otherwise
+leave every symbol added after the first run unembedded.
+
+```bash
+srclight index --embed qwen3-embedding   # first run: picks the model
+srclight index                           # later runs: reuses qwen3-embedding
+```
+
+To set a default across projects — including brand new indexes — export the
+environment variable:
+
+```bash
+export SRCLIGHT_EMBED_MODEL=qwen3-embedding
+srclight index                           # embeds with qwen3-embedding
+```
+
+Resolution order is `--embed` > `SRCLIGHT_EMBED_MODEL` > the model stored in
+the index. `--no-embed` skips embeddings entirely for one run, whatever the
+other two say.
+
 ### How It Works
 
 1. Each symbol's name + signature + docstring + content is embedded as a float vector

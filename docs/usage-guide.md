@@ -222,9 +222,11 @@ srclight workspace index -w myworkspace -p project-name --embed qwen3-embedding
 
 Embedding is incremental — only symbols whose `body_hash` changed get re-embedded. The `.npy` sidecar is rebuilt automatically after embedding.
 
+`--embed` is only needed the first time: an index that already holds embeddings reuses its own model on every later run, so a bare `srclight index` re-embeds too. Set `SRCLIGHT_EMBED_MODEL` to pick a model for indexes that hold none yet, and pass `--no-embed` to skip embedding for a single run.
+
 ### Automating Embedding Refresh with Cron
 
-Git hooks keep the FTS5 index fresh on every commit, but they do **not** re-embed — embedding requires calling the embedding model (e.g. Ollama) and would slow down every commit. For teams that rely on `hybrid_search` or `semantic_search`, a nightly cron job keeps embeddings current without manual intervention.
+Git hooks reindex in the background with a bare `srclight index .`, so they re-embed whenever the index already holds a model (or `SRCLIGHT_EMBED_MODEL` is exported to the hook's environment). That covers day-to-day drift. A nightly cron job is still useful to catch repos whose embedding provider was down at commit time, and to install hooks in newly added repos.
 
 ```bash
 # Add to crontab (crontab -e)
@@ -249,10 +251,10 @@ tail -50 /tmp/srclight-embed-cron.log
 | Layer | What triggers it | What it does | Speed |
 |-------|-----------------|--------------|-------|
 | **FTS5 index** | Git hooks (`post-commit`, `post-checkout`) | Re-parses changed files via tree-sitter, updates symbol/edge tables and FTS5 indexes | 1-5s per commit |
-| **Embeddings** | Manual `--embed` or cron | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
+| **Embeddings** | Any index run once the model is known (hooks, cron, `--embed`) | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
 | **Vector cache** | Automatic after embedding | Rebuilds `.npy` sidecar files for GPU/CPU-resident search | <1s |
 
-The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag until the next `--embed` pass. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
+The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag whenever the provider is unreachable at index time — the run logs a warning and moves on. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
 
 ## Document Extraction
 

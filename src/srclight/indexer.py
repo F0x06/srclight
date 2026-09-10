@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -116,6 +117,9 @@ DEFAULT_IGNORE = [
 # Max file size to index (1 MB)
 MAX_FILE_SIZE = 1_000_000
 
+# Default embedding model, for every run that does not pass --embed
+EMBED_MODEL_ENV = "SRCLIGHT_EMBED_MODEL"
+
 
 @dataclass
 class IndexStats:
@@ -138,6 +142,30 @@ class IndexConfig:
     max_doc_file_size: int = 50_000_000  # 50 MB for documents (PDF, DOCX, etc.)
     languages: list[str] | None = None  # None = all supported
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
+    disable_embeddings: bool = False  # --no-embed: index without touching embeddings
+
+
+def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
+    """Pick the embedding model for a run.
+
+    Priority: the explicit model (--embed) > SRCLIGHT_EMBED_MODEL > the model
+    the index already holds. That last fallback is what keeps embeddings alive
+    across the flag-less reindexes run by the git hooks and the MCP server —
+    without it, every symbol added after the first `--embed` run stays
+    unembedded. `disable_embeddings` opts out of all three.
+    """
+    if config.disable_embeddings:
+        return None
+
+    explicit = (config.embed_model or "").strip()
+    if explicit:
+        return explicit
+
+    from_env = os.environ.get(EMBED_MODEL_ENV, "").strip()
+    if from_env:
+        return from_env
+
+    return db.detect_embedding_model()
 
 
 def _should_ignore(path: Path, root: Path, patterns: list[str]) -> bool:
@@ -639,11 +667,12 @@ class Indexer:
             except Exception:
                 logger.warning("Community detection failed", exc_info=True)
 
-        # Build embeddings (optional, only if embed_model configured)
-        if self.config.embed_model:
-            n_embedded = self._build_embeddings(self.config.embed_model)
+        # Build embeddings (optional, only if a model is configured or known)
+        embed_model = resolve_embed_model(self.db, self.config)
+        if embed_model:
+            n_embedded = self._build_embeddings(embed_model)
             if n_embedded > 0:
-                logger.info("Embedded %d symbols with %s", n_embedded, self.config.embed_model)
+                logger.info("Embedded %d symbols with %s", n_embedded, embed_model)
 
         # Update index state
         git_head = _get_git_head(root)

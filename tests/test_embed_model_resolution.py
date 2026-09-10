@@ -79,6 +79,58 @@ def test_the_dominant_model_wins_when_the_index_holds_several(db, monkeypatch):
     assert resolve_embed_model(db, IndexConfig()) == "qwen3-embedding"
 
 
+def test_the_recorded_model_beats_the_row_counts(db, monkeypatch):
+    """A half-finished switch must not silently revert on the next run.
+
+    embed_symbols returns what it managed to embed when a batch fails, so an
+    index can end up mostly old-model, partly new-model. Row counting would
+    hand the majority back and re-embed the new rows into the old model,
+    paying for the calls twice.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    _seed_embeddings(db, "qwen3-embedding", "qwen3-embedding", "voyage-code-3")
+    db.remember_embedding_model("voyage-code-3")
+
+    assert resolve_embed_model(db, IndexConfig()) == "voyage-code-3"
+
+
+def test_row_counts_still_answer_for_indexes_built_before_the_record(db, monkeypatch):
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    _seed_embeddings(db, "qwen3-embedding")
+
+    assert db.detect_embedding_model() == "qwen3-embedding"
+
+
+def test_an_embedding_run_records_the_model_it_used(repo, stub_provider, monkeypatch):
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+
+    result = CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"])
+    assert result.exit_code == 0, result.output
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    try:
+        assert db.detect_embedding_model() == "stub-model"
+    finally:
+        db.close()
+
+
+def test_a_failed_run_records_nothing(repo, stub_provider, monkeypatch):
+    """A typo'd model must not become the index's remembered choice."""
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+    stub_provider["results"] = []  # every batch failed
+
+    result = CliRunner().invoke(main, ["index", str(repo), "--embed", "typo-model"])
+    assert result.exit_code == 0, result.output
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    try:
+        assert db.detect_embedding_model() is None
+    finally:
+        db.close()
+
+
 def test_a_fresh_index_resolves_to_no_model(db, monkeypatch):
     monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
 
@@ -111,6 +163,34 @@ def repo(tmp_path):
     result = CliRunner().invoke(main, ["index", str(tmp_path)])
     assert result.exit_code == 0, result.output
     return tmp_path
+
+
+@pytest.fixture
+def stub_provider(monkeypatch):
+    """Embed for real against a fake provider — no network, no Ollama.
+
+    `results` is what embed_symbols hands back; empty means every batch failed.
+    """
+    from srclight import embeddings as embeddings_mod
+
+    state: dict = {"results": None}
+
+    class _Stub:
+        def __init__(self, spec):
+            self.name = spec
+            self.dimensions = 3
+
+    def fake_get_provider(model_spec, **kwargs):
+        return _Stub(model_spec)
+
+    def fake_embed_symbols(provider, symbols, on_progress=None):
+        if state["results"] is not None:
+            return state["results"]
+        return [(s["id"], vector_to_bytes([0.1, 0.2, 0.3])) for s in symbols]
+
+    monkeypatch.setattr(embeddings_mod, "get_provider", fake_get_provider)
+    monkeypatch.setattr(embeddings_mod, "embed_symbols", fake_embed_symbols)
+    return state
 
 
 @pytest.fixture
@@ -201,3 +281,27 @@ def test_reindex_skips_embeddings_when_the_agent_asks(mcp_repo, embed_calls):
     _call(mcp_repo.reindex(embed=False))
 
     assert embed_calls == []
+
+
+def test_reindex_releases_the_vector_cache_before_indexing(mcp_repo, embed_calls, monkeypatch):
+    """The embedding pass rewrites embeddings.npy — which the server may hold mmap'd.
+
+    `os.replace` over a live mapping fails on Windows, _build_embeddings
+    swallows it, and the sidecar then keeps a version the bumped
+    embedding_cache_version no longer matches: every semantic_search falls
+    back to a full SQLite scan for the life of the server. Releasing the
+    cache after indexing, as reindex used to, is too late.
+    """
+    seen = {}
+    real_index = Indexer.index
+
+    def spy(self, root, **kwargs):
+        seen["cache"] = mcp_repo._vector_cache
+        return real_index(self, root, **kwargs)
+
+    monkeypatch.setattr(Indexer, "index", spy)
+    mcp_repo._vector_cache = object()  # stand-in for a mapped sidecar
+
+    _call(mcp_repo.reindex())
+
+    assert seen["cache"] is None, "sidecar still mapped while the embedding pass rewrote it"

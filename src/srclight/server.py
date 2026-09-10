@@ -1232,10 +1232,11 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
     Args:
         path: Optional specific directory to re-index (default: entire repo)
         embed: Also refresh embeddings, using the model this index already
-            holds (or SRCLIGHT_EMBED_MODEL). Pass False for a keyword-only
-            refresh when you just need search_symbols current — embedding a
-            large backlog calls the embedding model and can take minutes.
-            Ignored when the index holds no embeddings.
+            holds (or SRCLIGHT_EMBED_MODEL, which applies even to an index
+            that holds none yet). Pass False for a keyword-only refresh when
+            you just need search_symbols current — embedding a large backlog
+            calls the embedding model and can take minutes. Does nothing when
+            no model is configured or recorded.
     """
     global _vector_cache
     # `path` is used as an index ROOT, not a filter: Indexer reads the whole
@@ -1267,12 +1268,17 @@ async def reindex(path: str | None = None, embed: bool = True) -> str:
 
     root = root.resolve()
     db = _get_db()
+    # Release the vector cache BEFORE indexing, not after: the embedding pass
+    # rewrites embeddings.npy through os.replace, which fails on Windows while
+    # this process still holds the old file mmap'd (np.load(mmap_mode="r")).
+    # _build_embeddings swallows that failure, leaving a sidecar whose version
+    # no longer matches the bumped embedding_cache_version — every later
+    # semantic_search then falls back to a full SQLite scan.
+    _vector_cache = None
+
     config = IndexConfig(root=root, disable_embeddings=not embed)
     indexer = Indexer(db, config)
     stats = indexer.index(root)
-
-    # Invalidate vector cache so next query reloads from fresh sidecar
-    _vector_cache = None
 
     result = {
         "files_indexed": stats.files_indexed,

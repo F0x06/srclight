@@ -1295,6 +1295,13 @@ class Indexer:
             logger.error("Embedding failed: %s", e)
             return 0
 
+        # Remember what actually embedded, so the next flag-less run continues
+        # with it. Recorded only on success: a typo'd model must not become the
+        # index's choice, and a switch that failed part way through must not be
+        # reverted by the old model's row count.
+        if results:
+            self.db.remember_embedding_model(provider.name)
+
         # Store embeddings
         dims = provider.dimensions
         for symbol_id, emb_bytes in results:

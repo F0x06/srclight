@@ -111,7 +111,11 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     db.initialize()
 
     config = IndexConfig(root=root, embed_model=embed_model, disable_embeddings=no_embed)
+    # Resolve once and pin the result: resolving again inside the indexer, after
+    # the file pass, can disagree with what we printed here — a checkout that
+    # drops every embedded file cascade-deletes its embeddings mid-run.
     resolved_model = resolve_embed_model(db, config)
+    config.embed_model = resolved_model
     if resolved_model and not embed_model:
         click.echo(f"Embedding model: {resolved_model} (from the existing index)")
     elif resolved_model:
@@ -426,6 +430,7 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None, 
                 root=root, embed_model=embed_model, disable_embeddings=no_embed,
             )
             resolved_model = resolve_embed_model(db, indexer_config)
+            indexer_config.embed_model = resolved_model  # pin it, see index()
             if resolved_model and not embed_model:
                 click.echo(f"    Embedding model: {resolved_model} (from the existing index)")
             indexer = Indexer(db, indexer_config)

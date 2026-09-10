@@ -1319,13 +1319,26 @@ class Database:
             })
         return results
 
-    def detect_embedding_model(self) -> str | None:
-        """The embedding model this index was built with, if any.
-
-        An index can hold rows from several models (the user switched); the
-        one covering the most symbols is the one worth continuing with.
-        """
+    def remember_embedding_model(self, model: str) -> None:
+        """Record the model this index embeds with, for flag-less runs."""
         assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('embed_model', ?)",
+            (model,),
+        )
+
+    def detect_embedding_model(self) -> str | None:
+        """The embedding model this index was built with, if any."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'embed_model'"
+        ).fetchone()
+        if row and row["value"]:
+            return row["value"]
+
+        # Indexes embedded before the choice was recorded: infer it from the
+        # rows. An index can hold several models (a switch that failed part
+        # way through), so the one covering the most symbols wins.
         row = self.conn.execute(
             """SELECT model, COUNT(*) AS n FROM symbol_embeddings
                GROUP BY model ORDER BY n DESC, model ASC LIMIT 1"""

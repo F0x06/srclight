@@ -369,6 +369,10 @@ def _get_db() -> Database:
 
 _vector_cache_rebuild_lock = threading.Lock()
 _vector_cache_rebuild_failed_at: int | None = None
+# True from the moment a rebuild releases our mmap until it has finished.
+# Read without the lock on purpose: a reader must not queue behind a
+# multi-second build just to learn it should not touch the file.
+_vector_cache_rebuilding = False
 
 
 def _rebuild_vector_cache(db):
@@ -396,7 +400,7 @@ def _rebuild_vector_cache(db):
     another long-lived reader holding it mapped — costs one attempt, not one
     per search forever.
     """
-    global _vector_cache, _vector_cache_rebuild_failed_at
+    global _vector_cache, _vector_cache_rebuild_failed_at, _vector_cache_rebuilding
 
     from .vector_cache import VectorCache
 
@@ -417,6 +421,10 @@ def _rebuild_vector_cache(db):
         stale = _vector_cache
         fresh = VectorCache(srclight_dir)
         try:
+            # Announce before releasing: from here to the end of the build,
+            # a reader finding an unloaded cache must leave the file alone
+            # rather than mapping it again — see _get_vector_cache.
+            _vector_cache_rebuilding = True
             if stale is not None:
                 stale.invalidate()  # drop our mmap so os.replace can land
             fresh.build_from_db(db.conn)
@@ -428,6 +436,8 @@ def _rebuild_vector_cache(db):
             _vector_cache_rebuild_failed_at = version
             _vector_cache = None
             return None
+        finally:
+            _vector_cache_rebuilding = False
 
         if not fresh.is_loaded():
             # build_from_db returns without loading anything when the index
@@ -464,11 +474,16 @@ def _get_vector_cache():
         # life of the server. We hold the mapping, so we are who can refresh
         # it.
         if not _vector_cache.is_loaded():
-            # Empty, not finished: a rebuild dropped our mmap and then could
-            # not write, or there was nothing to build from. Never terminal —
-            # fall through to the cold path and read the disk again, or the
-            # server would serve the SQLite scan for the rest of its life
-            # even once a perfectly good sidecar appears.
+            if _vector_cache_rebuilding:
+                # A rebuild released this mapping deliberately and is about to
+                # replace the file. Re-reading it now is what makes os.replace
+                # fail on Windows, so take the SQLite scan for this one call.
+                return _vector_cache
+            # Empty and nobody is rebuilding: a rebuild dropped our mmap and
+            # then could not write, or there was nothing to build from. Never
+            # terminal — fall through to the cold path and read the disk
+            # again, or the server would serve the SQLite scan for the rest of
+            # its life even once a perfectly good sidecar appears.
             _vector_cache = None
         elif not _vector_cache.is_valid(db.conn):
             return _rebuild_vector_cache(db)

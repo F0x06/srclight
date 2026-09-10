@@ -653,6 +653,54 @@ def test_a_sidecar_this_process_cannot_replace_is_attempted_once(repo, stub_prov
         server_mod.configure(db_path=None, repo_root=None)
 
 
+def test_a_reader_during_a_rebuild_does_not_remap_the_file(repo, stub_provider, monkeypatch):
+    """The rebuild drops our mmap on purpose; a reader must not put it back.
+
+    Search tools are sync MCP tools, so FastMCP runs them on worker threads
+    and a second search during a rebuild is ordinary. Reaching the cold path
+    there re-maps the very file the rebuilder is about to os.replace, which
+    on Windows makes the rebuild fail — defeating the whole reason the
+    rebuild happens in this process.
+    """
+    from srclight import server as server_mod
+    from srclight.vector_cache import VectorCache
+
+    assert CliRunner().invoke(main, ["index", str(repo), "--embed", "stub-model"]).exit_code == 0
+
+    db_path = repo / ".srclight" / "index.db"
+    monkeypatch.setattr(server_mod, "_workspace_name", None)
+    server_mod.configure(db_path=db_path, repo_root=repo)
+    try:
+        assert server_mod._get_vector_cache().is_loaded()
+
+        observed = {}
+        real_build = VectorCache.build_from_db
+
+        def build_with_a_reader_in_the_middle(self, conn):
+            # Stands in for the other worker thread, at the exact moment our
+            # mapping is gone and the replace has not happened yet.
+            concurrent = server_mod._get_vector_cache()
+            observed["remapped"] = concurrent is not None and concurrent.is_loaded()
+            return real_build(self, conn)
+
+        monkeypatch.setattr(VectorCache, "build_from_db", build_with_a_reader_in_the_middle)
+
+        other = Database(db_path)
+        other.open()
+        sym_id = other.conn.execute("SELECT id FROM symbols LIMIT 1").fetchone()["id"]
+        other.upsert_embedding(sym_id, "stub:stub-model", 3, vector_to_bytes([0.9, 0.9, 0.9]))
+        other.commit()
+        other.close()
+
+        rebuilt = server_mod._get_vector_cache()
+
+        assert observed.get("remapped") is False, "a reader re-mapped the file mid-rebuild"
+        assert rebuilt is not None and rebuilt.is_loaded(), "the rebuild did not land"
+    finally:
+        server_mod._close_databases()
+        server_mod.configure(db_path=None, repo_root=None)
+
+
 def test_the_fast_path_comes_back_once_the_obstruction_lifts(repo, stub_provider, monkeypatch):
     """A failed rebuild must not pin the server to the SQLite scan for good.
 

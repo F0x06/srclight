@@ -176,6 +176,13 @@ def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
     if recorded:
         return recorded
 
+    # An index told to forget stays off, whatever the environment says. The
+    # docs send users to export the variable and the hooks inherit it, so
+    # letting it win here would leave the one person who most needs the off
+    # switch — the one paying a metered provider on every commit — without one.
+    if db.embedding_model_forgotten():
+        return None
+
     return os.environ.get(EMBED_MODEL_ENV, "").strip() or None
 
 

@@ -197,7 +197,9 @@ Note that skipping is not free. Reindexing a changed file drops the
 embeddings of the symbols it replaces, and a skipped pass does not put them
 back — semantic coverage decays on exactly the files being edited. Ask
 `embedding_status()` what an index will do: `configured_model` is the model
-the next flag-less run uses, and null means it will not embed.
+the next flag-less run resolves to — the whole chain, environment variable
+included — and null means it will not embed. Single-repo mode only: in a
+workspace each project records its own, so the field is not reported.
 
 ### How It Works
 

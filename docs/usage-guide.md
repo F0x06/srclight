@@ -193,7 +193,7 @@ The `project` parameter filters to one repo. Omit it to search all.
 2. The `post-commit` hook fires (background, non-blocking)
 3. `srclight index .` runs with `flock` (prevents concurrent re-indexes)
 4. Changed files are re-parsed (tree-sitter), FTS5 indexes updated
-5. Embeddings are refreshed too, if this index has a recorded model
+5. Embeddings are refreshed too, if this index has a recorded model (or `SRCLIGHT_EMBED_MODEL` reaches the hook and the index has recorded nothing)
 6. Output logged to `.srclight/reindex.log`
 
 **Note**: step 5 is why `--embed` is passed only once. An index that has never embedded stays keyword-only, and `--forget-embed-model` takes an index back to that state. If the embedding provider is unreachable when the hook fires, the run logs a warning and keeps the parse work: FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is never held hostage to the embedding model.
@@ -203,7 +203,7 @@ The `project` parameter filters to one repo. Omit it to search all.
 1. `git checkout other-branch` triggers `post-checkout` hook
 2. Only fires on branch checkouts (not file checkouts) and only when HEAD changes
 3. Same background `srclight index .` as post-commit
-4. FTS5 indexes updated for all files that differ between branches, and embeddings with them when the index has a recorded model
+4. FTS5 indexes updated for all files that differ between branches, and embeddings with them when a model resolves (see post-commit, step 5)
 
 ### Re-Embedding After Significant Changes
 
@@ -227,7 +227,7 @@ Embedding is incremental — only symbols whose `body_hash` changed get re-embed
 
 ### Automating Embedding Refresh with Cron
 
-Git hooks reindex in the background with a bare `srclight index .`, so they re-embed whenever the index already holds a model (or `SRCLIGHT_EMBED_MODEL` is exported to the hook's environment). That covers day-to-day drift. A nightly cron job is still useful to catch repos whose embedding provider was down at commit time, and to install hooks in newly added repos.
+Git hooks reindex in the background with a bare `srclight index .`, so they re-embed whenever a model resolves — the one recorded in the index, or `SRCLIGHT_EMBED_MODEL` if the hook's environment carries it and the index has recorded nothing. `srclight index --forget-embed-model` records a deliberate "off" that outranks the variable. That covers day-to-day drift. A nightly cron job is still useful to catch repos whose embedding provider was down at commit time, and to install hooks in newly added repos.
 
 ```bash
 # Add to crontab (crontab -e)
@@ -255,7 +255,7 @@ tail -50 /tmp/srclight-embed-cron.log
 | **Embeddings** | Any index run once the model is known (hooks, cron, `--embed`) | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
 | **Vector cache** | Automatic after embedding | Rebuilds `.npy` sidecar files for GPU/CPU-resident search | <1s |
 
-The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag whenever the provider is unreachable at index time — the run logs a warning and moves on. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
+The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag whenever no model resolves for a run (`--no-embed`, `--forget-embed-model`, or an index that has never embedded) or the provider is unreachable at index time — that last case logs a warning and moves on, keeping the parse work. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
 
 ## Document Extraction
 

@@ -1683,8 +1683,7 @@ def semantic_search(
     if not emb_stats.get("model"):
         return json.dumps({
             "error": "No embeddings found. Run 'srclight index --embed <model>' first.",
-            "hint": "Try: srclight index --embed qwen3-embedding — once; the index "
-                    "records the model and later runs reuse it",
+            "hint": "Try: srclight index --embed qwen3-embedding",
         })
 
     model_name = emb_stats["model"]
@@ -1817,6 +1816,13 @@ def embedding_status(project: str | None = None) -> str:
     Shows how many symbols have embeddings, which model was used,
     and the coverage percentage.
 
+    In single-repo mode the result also carries `configured_model`: the model
+    the next flag-less run (a git hook, or reindex()) will actually use, null
+    meaning it will not embed. `model` differs — it names a model already
+    present in the rows, which after a switch can be one no run will use
+    again. Workspace mode does not report `configured_model`: each project
+    records its own, and they need not agree.
+
     Args:
         project: Project name (workspace mode) or uses current repo
     """
@@ -1829,12 +1835,13 @@ def embedding_status(project: str | None = None) -> str:
         # stats["model"] comes from an arbitrary embedding row, so after a
         # model switch it can name the old one. This is the model a flag-less
         # run — every git hook, and reindex() — will actually use; null means
-        # such a run leaves embeddings alone.
-        stats["configured_model"] = db.detect_embedding_model()
+        # such a run leaves embeddings alone. Resolved, not just read back:
+        # SRCLIGHT_EMBED_MODEL is the third leg of the same chain, and an
+        # index with no record still embeds when it is exported.
+        stats["configured_model"] = resolve_embed_model(db, IndexConfig())
 
     if not stats.get("model"):
-        stats["hint"] = ("Run 'srclight index --embed <model>' once to generate embeddings; "
-                         "later runs reuse the model recorded in the index")
+        stats["hint"] = "Run 'srclight index --embed <model>' to generate embeddings"
 
     return json.dumps(stats, indent=2)
 

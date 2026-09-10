@@ -143,6 +143,21 @@ def test_a_failed_run_records_nothing(repo, stub_provider, monkeypatch):
         db.close()
 
 
+def test_forgetting_survives_an_exported_env_var(db, monkeypatch):
+    """The off switch must be an off switch for the user the README created.
+
+    The docs tell people to export SRCLIGHT_EMBED_MODEL, and the hooks
+    inherit it. If the variable outranks a deliberate forget, the one person
+    who most needs to stop calling a metered provider — the one who exported
+    it — cannot, and four user-facing strings promise otherwise.
+    """
+    monkeypatch.setenv("SRCLIGHT_EMBED_MODEL", "voyage-code-3")
+    _seed_embeddings(db, "qwen3-embedding")
+    db.forget_embedding_model()
+
+    assert resolve_embed_model(db, IndexConfig()) is None
+
+
 def test_a_fresh_index_resolves_to_no_model(db, monkeypatch):
     monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
 

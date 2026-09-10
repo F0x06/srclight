@@ -1336,6 +1336,20 @@ class Database:
         """
         self.remember_embedding_model("")
 
+    def embedding_model_forgotten(self) -> bool:
+        """Whether this index was explicitly told to stop embedding.
+
+        Distinct from "no model recorded": both make detect_embedding_model
+        return None, but only this one must also outrank SRCLIGHT_EMBED_MODEL
+        — otherwise the off switch does not work for the very user the docs
+        told to export it.
+        """
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'embed_model'"
+        ).fetchone()
+        return row is not None and not row["value"]
+
     def has_embeddings(self) -> bool:
         """Whether this index holds any embedding at all."""
         assert self.conn is not None

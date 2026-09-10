@@ -130,7 +130,10 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     resolved_model = resolve_embed_model(db, config)
     config.embed_model = resolved_model
     if no_embed:
-        click.echo("Embeddings: skipped (--no-embed)")
+        if embed_model:
+            click.echo(f"Embeddings: skipped (--no-embed); --embed {embed_model} ignored")
+        else:
+            click.echo("Embeddings: skipped (--no-embed)")
     elif resolved_model and embed_model:
         click.echo(f"Embedding model: {resolved_model}")
     elif resolved_model:
@@ -162,6 +165,7 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
 
     if resolved_model:
         emb_stats = db.embedding_stats()
+        click.echo(f"  Embedded now:    {stats.symbols_embedded}")
         click.echo(f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
                     f" ({emb_stats['coverage_pct']}%)")
 
@@ -418,7 +422,7 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
                     no_embed: bool, forget_embed_model: bool):
     """Index all (or one) project in a workspace."""
     from .db import Database
-    from .indexer import IndexConfig, Indexer, resolve_embed_model
+    from .indexer import EMBED_MODEL_ENV, IndexConfig, Indexer, resolve_embed_model
     from .workspace import WorkspaceConfig
 
     config = WorkspaceConfig.load(ws_name)
@@ -431,7 +435,10 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
             sys.exit(1)
 
     if no_embed:
-        click.echo("Embeddings: skipped (--no-embed)")
+        if embed_model:
+            click.echo(f"Embeddings: skipped (--no-embed); --embed {embed_model} ignored")
+        else:
+            click.echo("Embeddings: skipped (--no-embed)")
     elif embed_model:
         click.echo(f"Embedding model: {embed_model}")
 
@@ -463,7 +470,10 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
             resolved_model = resolve_embed_model(db, indexer_config)
             indexer_config.embed_model = resolved_model  # pin it, see index()
             if resolved_model and not embed_model:
-                click.echo(f"    Embedding model: {resolved_model} (from the existing index)")
+                origin = ("from the existing index"
+                          if resolved_model == db.detect_embedding_model()
+                          else f"from ${EMBED_MODEL_ENV}")
+                click.echo(f"    Embedding model: {resolved_model} ({origin})")
             indexer = Indexer(db, indexer_config)
 
             def on_progress(file: str, current: int, total: int):

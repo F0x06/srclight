@@ -425,7 +425,10 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
         return
 
     try:
-        arguments = coerce_arguments(spec.input_schema, parse_cli_pairs(list(ctx.args)))
+        properties = spec.input_schema.get("properties", {})
+        arguments = coerce_arguments(
+            spec.input_schema, parse_cli_pairs(list(ctx.args), properties)
+        )
     except ToolArgumentError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(2)

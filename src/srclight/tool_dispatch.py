@@ -22,12 +22,19 @@ class ToolArgumentError(Exception):
     """A usage error whose message is meant for the person who typed it."""
 
 
-def parse_cli_pairs(tokens: list[str]) -> dict[str, str]:
+def parse_cli_pairs(tokens: list[str], properties: dict[str, Any]) -> dict[str, str]:
     """Turn ``["--key", "value", "--flag"]`` into ``{"key": "value", "flag": "true"}``.
 
     A bare ``--flag`` (nothing after it, or another option next) reads as
     "true" so boolean arguments behave the way a shell user expects. Dashes in
     names become underscores, since MCP argument names are snake_case.
+
+    Which argument may be bare is a question for ``properties``, the schema's
+    own: only a boolean can be. Everything else takes the next token whatever
+    it looks like, so a value of ``--`` — a Lua comment, a regex alternation —
+    is a value and not a second option. A name the schema does not know stays
+    permissive: there is no type to consult, and reading it as a flag is what
+    lets ``coerce_arguments`` report the misspelling itself.
     """
     pairs: dict[str, str] = {}
     i = 0
@@ -40,18 +47,25 @@ def parse_cli_pairs(tokens: list[str]) -> dict[str, str]:
         body = token[2:]
         if "=" in body:
             name, value = body.split("=", 1)
+            name = name.replace("-", "_")
             i += 1
         else:
-            name = body
+            name = body.replace("-", "_")
             nxt = tokens[i + 1] if i + 1 < len(tokens) else None
-            # "--limit -1": a lone dash-number is a value, not an option.
-            if nxt is not None and (not nxt.startswith("--")):
+            prop = properties.get(name)
+            if prop is not None and "boolean" not in _accepted_types(prop):
+                if nxt is None:
+                    raise ToolArgumentError(f"--{body} expects a value")
+                value = nxt
+                i += 2
+            elif nxt is not None and (not nxt.startswith("--")):
+                # "--limit -1": a lone dash-number is a value, not an option.
                 value = nxt
                 i += 2
             else:
                 value = "true"
                 i += 1
-        pairs[name.replace("-", "_")] = value
+        pairs[name] = value
     return pairs
 
 
@@ -168,6 +182,11 @@ def format_tool_help(name: str, description: str, schema: dict[str, Any]) -> str
         lines.append("This tool takes no arguments.")
         return "\n".join(lines)
 
+    lines.append(
+        "Spell each one --name value, or --name=value. A value is taken "
+        "literally, so a pattern may begin with dashes."
+    )
+    lines.append("")
     lines.append("Arguments:")
     for arg in sorted(properties):
         prop = properties[arg]

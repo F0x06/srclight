@@ -143,7 +143,8 @@ srclight tool find_pattern --pattern 'this->timer' --kind function --limit 80
 ```
 
 Output is the tool's JSON on stdout and nothing else, so it pipes. Exit codes
-are 0 on success, 1 when the tool reports an error, 2 on a usage error.
+are 0 on success, 1 when the tool reports an error, 2 on a usage error — a
+usage error writes nothing to stdout and says why on stderr.
 
 The command reads the server's own tool registry, so it always matches the
 tools your MCP client sees — and a tool renamed on the MCP side is renamed

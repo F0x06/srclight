@@ -378,7 +378,9 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
     here too.
 
     Output is the tool's JSON on stdout and nothing else. Exit codes: 0 on
-    success, 1 when the tool reports an error, 2 on a usage error.
+    success, 1 when the tool reports an error, 2 on a usage error — and a
+    usage error, having no tool result to report, leaves stdout empty and
+    says why on stderr.
     """
     import asyncio
 
@@ -447,9 +449,10 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
     except Exception as e:
         # mcp.call_tool() raises rather than returning an isError result, so
         # this is the only path most tool failures take (missing index, bad
-        # --db, unknown workspace, ...). Keep stdout as JSON per the
-        # documented contract even here, so a sandbox parsing stdout never
-        # has to special-case the error path.
+        # --db, unknown workspace, ...). Keep stdout as JSON here too, so a
+        # caller that reached the tool at all still parses one shape. A usage
+        # error is the other case and does not: it exits 2 with stdout empty
+        # and the reason on stderr, because there is no tool result to speak of.
         click.echo(json.dumps({"error": f"{type(e).__name__}: {e}"}))
         click.echo(f"Error: tool '{spec.name}' failed: {e}", err=True)
         sys.exit(1)

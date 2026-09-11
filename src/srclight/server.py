@@ -2307,7 +2307,10 @@ def find_pattern(
     `matched_lines_total` is how many LINES matched inside them, and
     `truncated` says whether more symbols existed beyond `limit`. When
     `truncated` is true, `matched_lines_total` is a floor over what was
-    returned, not a repo-wide total — nothing here ever scans the whole index.
+    returned, not a repo-wide total: the search stops once it has enough
+    matching symbols to fill the page, so it never sees the rest of the
+    index. (A pattern that matches nothing never reaches that point and does
+    test every candidate symbol.)
 
     Pattern supports regex. Common patterns:
     - "Color\\\\(0x" — find raw color literals

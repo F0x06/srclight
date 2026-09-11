@@ -24,31 +24,55 @@ FIND_PATTERN_SCHEMA = {
 }
 
 
+PROPS = FIND_PATTERN_SCHEMA["properties"]
+
+
 class TestParseCliPairs:
     def test_separate_value(self):
-        assert parse_cli_pairs(["--pattern", "TODO"]) == {"pattern": "TODO"}
+        assert parse_cli_pairs(["--pattern", "TODO"], PROPS) == {"pattern": "TODO"}
 
     def test_equals_form(self):
-        assert parse_cli_pairs(["--pattern=TODO"]) == {"pattern": "TODO"}
+        assert parse_cli_pairs(["--pattern=TODO"], PROPS) == {"pattern": "TODO"}
 
     def test_dashes_become_underscores(self):
-        assert parse_cli_pairs(["--symbol-name", "x"]) == {"symbol_name": "x"}
+        assert parse_cli_pairs(["--symbol-name", "x"], PROPS) == {"symbol_name": "x"}
 
     def test_bare_flag_is_true(self):
-        assert parse_cli_pairs(["--verbose"]) == {"verbose": "true"}
+        assert parse_cli_pairs(["--verbose"], PROPS) == {"verbose": "true"}
 
     def test_bare_flag_before_another_flag(self):
-        assert parse_cli_pairs(["--verbose", "--limit", "5"]) == {
+        assert parse_cli_pairs(["--verbose", "--limit", "5"], PROPS) == {
             "verbose": "true", "limit": "5",
         }
 
     def test_value_may_look_negative(self):
-        assert parse_cli_pairs(["--limit", "-1"]) == {"limit": "-1"}
+        assert parse_cli_pairs(["--limit", "-1"], PROPS) == {"limit": "-1"}
 
     def test_a_bare_word_is_rejected(self):
         with pytest.raises(ToolArgumentError) as e:
-            parse_cli_pairs(["pattern", "TODO"])
+            parse_cli_pairs(["pattern", "TODO"], PROPS)
         assert "pattern" in str(e.value)
+
+    def test_a_value_may_begin_with_dashes(self):
+        # A Lua comment is "--", so this is the natural way to search one.
+        assert parse_cli_pairs(["--pattern", "--TODO"], PROPS) == {"pattern": "--TODO"}
+
+    def test_a_dashed_value_does_not_swallow_the_arguments_after_it(self):
+        assert parse_cli_pairs(["--pattern", "--[[", "--limit", "5"], PROPS) == {
+            "pattern": "--[[", "limit": "5",
+        }
+
+    def test_an_argument_that_needs_a_value_and_has_none_is_rejected(self):
+        with pytest.raises(ToolArgumentError) as e:
+            parse_cli_pairs(["--pattern"], PROPS)
+        assert "--pattern" in str(e.value)
+
+    def test_an_unknown_name_keeps_the_permissive_reading(self):
+        # No schema entry means no type to consult; reading it as a flag is
+        # what lets coerce_arguments report the misspelling itself.
+        assert parse_cli_pairs(["--patern", "--pattern", "TODO"], PROPS) == {
+            "patern": "true", "pattern": "TODO",
+        }
 
 
 class TestCoerceArguments:
@@ -99,6 +123,11 @@ class TestFormatToolHelp:
         assert "find_pattern" in text
         assert "--pattern" in text and "required" in text
         assert "--limit" in text and "50" in text
+
+    def test_help_documents_both_spellings(self):
+        text = format_tool_help("find_pattern", "Search for structural patterns.",
+                                FIND_PATTERN_SCHEMA)
+        assert "--name=value" in text
 
 
 class TestToolCommand:
@@ -170,6 +199,27 @@ class TestToolCommand:
         payload = json.loads(result.output)     # stdout is JSON and nothing else
         assert payload["match_count"] == 1
         assert payload["truncated"] is True
+
+    def test_a_pattern_beginning_with_dashes_reaches_the_tool(self, tmp_path):
+        """Searching for a Lua comment, spelled the way a shell user would."""
+        import json
+
+        from click.testing import CliRunner
+
+        from srclight.cli import main
+
+        (tmp_path / "main.lua").write_text(
+            "local function alpha()\n  -- TODO: one\nend\n"
+        )
+        assert CliRunner().invoke(main, ["index", str(tmp_path)]).exit_code == 0
+
+        result = CliRunner().invoke(
+            main, ["tool", "--db", str(tmp_path / ".srclight" / "index.db"),
+                   "find_pattern", "--pattern", "--\\s*TODO"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["match_count"] == 1
 
     def test_unknown_tool_exits_two_and_suggests(self):
         from click.testing import CliRunner

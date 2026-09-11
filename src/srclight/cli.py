@@ -390,6 +390,10 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
         parse_cli_pairs,
     )
 
+    if tool_name in ("--help", "-h"):
+        click.echo(ctx.get_help())
+        ctx.exit(0)
+
     tools = asyncio.run(mcp.list_tools())
     by_name = {t.name: t for t in tools}
 
@@ -405,6 +409,15 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
         hint = f" Did you mean: {', '.join(close)}?" if close else ""
         click.echo(f"Error: unknown tool '{tool_name}'.{hint} "
                    f"Run 'srclight tool --list' to see all tools.", err=True)
+        sys.exit(2)
+
+    if tool_name == "restart_server":
+        click.echo(
+            "Error: 'restart_server' only makes sense against a long-lived SSE "
+            "server process; a one-shot CLI invocation has nothing left to "
+            "restart into. Run it over MCP against a running 'srclight serve' "
+            "instead.", err=True,
+        )
         sys.exit(2)
 
     if "--help" in ctx.args or "-h" in ctx.args:
@@ -426,7 +439,18 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
         root = _find_repo_root(Path.cwd())
         configure(db_path=_get_db_path(root), repo_root=root)
 
-    result = asyncio.run(mcp.call_tool(spec.name, arguments))
+    try:
+        result = asyncio.run(mcp.call_tool(spec.name, arguments))
+    except Exception as e:
+        # mcp.call_tool() raises rather than returning an isError result, so
+        # this is the only path most tool failures take (missing index, bad
+        # --db, unknown workspace, ...). Keep stdout as JSON per the
+        # documented contract even here, so a sandbox parsing stdout never
+        # has to special-case the error path.
+        click.echo(json.dumps({"error": f"{type(e).__name__}: {e}"}))
+        click.echo(f"Error: tool '{spec.name}' failed: {e}", err=True)
+        sys.exit(1)
+
     text = "\n".join(
         block.text for block in result.content if getattr(block, "text", None) is not None
     )
@@ -435,10 +459,11 @@ def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
     if getattr(result, "isError", False):
         sys.exit(1)
     try:
-        if isinstance(json.loads(text), dict) and "error" in json.loads(text):
-            sys.exit(1)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        pass
+        parsed = None
+    if isinstance(parsed, dict) and "error" in parsed:
+        sys.exit(1)
 
 
 # --- Workspace commands ---

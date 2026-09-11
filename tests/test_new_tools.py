@@ -680,6 +680,68 @@ class TestFindPatternTruncation:
         assert page["match_count"] == 2
         assert page["truncated"] is False
 
+    def test_scan_stops_once_limit_is_reached(self, db, tmp_path, monkeypatch):
+        """The row scan must stay bounded even when almost everything matches.
+
+        If a future change collected every matching symbol into a list
+        before slicing to `limit` (instead of breaking out of the database
+        cursor loop as soon as enough results are found), this would fail:
+        `scanned["n"]` would climb toward the full 500 inserted symbols
+        instead of staying near `limit`. That is the "nothing here ever
+        scans the whole index" promise in `find_pattern`'s docstring.
+        """
+        import json
+
+        from srclight import db as db_mod
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(500):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 3 + 1, end_line=i * 3 + 2,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        scanned = {"n": 0}
+        original = db_mod.Database._row_to_symbol
+
+        def counting(self, row):
+            scanned["n"] += 1
+            return original(self, row)
+
+        monkeypatch.setattr(db_mod.Database, "_row_to_symbol", counting)
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=1))
+
+        assert result["match_count"] == 1
+        assert result["truncated"] is True
+        # Every one of the 500 symbols matches, so if the scan were
+        # unbounded this would be 500, not a handful.
+        assert scanned["n"] <= 5
+
+    def test_truncated_is_exact_when_offset_is_nonzero(self, db, tmp_path, monkeypatch):
+        """`truncated` must reflect what's left *after* `offset`, not just `limit`.
+
+        This is the seam between paging (`offset`) and truncation detection
+        (`limit + 1`): a page in the middle of a result set must report
+        `truncated: true` when more rows remain beyond it, and the final
+        page must report `truncated: false` even though `offset > 0`. Prior
+        coverage only exercised offset with a final, exactly-fitting page.
+        """
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(5):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        middle_page = json.loads(server_mod.find_pattern("TODO", limit=2, offset=1))
+        assert middle_page["match_count"] == 2
+        assert middle_page["truncated"] is True  # 2 more (indices 3, 4) remain
+
+        final_page = json.loads(server_mod.find_pattern("TODO", limit=2, offset=3))
+        assert final_page["match_count"] == 2
+        assert final_page["truncated"] is False  # nothing left after this page
+
     def test_existing_keys_are_untouched(self, db, tmp_path, monkeypatch):
         """The additive-only constraint, asserted rather than assumed."""
         import json

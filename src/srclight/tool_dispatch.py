@@ -115,9 +115,39 @@ def coerce_arguments(schema: dict[str, Any], raw: dict[str, str]) -> dict[str, o
                 raise ToolArgumentError(
                     f"--{name} expects true or false, got {value!r}"
                 )
+        elif "array" in types:
+            items_type = _array_item_type(properties[name])
+            if items_type is not None and items_type != "string":
+                raise ToolArgumentError(
+                    f"--{name} is a list of {items_type}, which cannot be "
+                    f"expressed on the command line"
+                )
+            out[name] = [item.strip() for item in value.split(",")]
+        elif "object" in types:
+            # No non-scalar besides array exists in the registry today, but
+            # an object would have no command-line spelling either.
+            raise ToolArgumentError(
+                f"--{name} is an object, which cannot be expressed on the command line"
+            )
         else:
             out[name] = value
     return out
+
+
+def _array_item_type(prop: dict[str, Any]) -> str | None:
+    """The declared ``items.type`` of an array-typed property, if any."""
+    if prop.get("type") == "array":
+        items = prop.get("items")
+        if isinstance(items, dict):
+            return items.get("type")
+        return None
+    for branch in prop.get("anyOf", []):
+        if isinstance(branch, dict) and branch.get("type") == "array":
+            items = branch.get("items")
+            if isinstance(items, dict):
+                return items.get("type")
+            return None
+    return None
 
 
 def format_tool_help(name: str, description: str, schema: dict[str, Any]) -> str:
@@ -129,6 +159,11 @@ def format_tool_help(name: str, description: str, schema: dict[str, Any]) -> str
     lines = [f"Usage: srclight tool {name} [ARGUMENTS]", ""]
     if summary:
         lines += [summary, ""]
+    lines.append(
+        "Arguments are derived from the running server's schema for this "
+        "tool and may change as that schema changes."
+    )
+    lines.append("")
     if not properties:
         lines.append("This tool takes no arguments.")
         return "\n".join(lines)
@@ -137,7 +172,11 @@ def format_tool_help(name: str, description: str, schema: dict[str, Any]) -> str
     for arg in sorted(properties):
         prop = properties[arg]
         types = _accepted_types(prop) or {"string"}
-        kind = "|".join(sorted(types))
+        if "array" in types:
+            item_type = _array_item_type(prop) or "string"
+            kind = f"comma-separated {item_type} list"
+        else:
+            kind = "|".join(sorted(types))
         if arg in required:
             note = "required"
         else:

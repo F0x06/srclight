@@ -2335,6 +2335,12 @@ def find_pattern(
     except _re.error as e:
         return json.dumps({"error": f"Invalid regex pattern: {e}"}, indent=2)
 
+    # Clamp before use: a negative limit would otherwise make `limit + 1`
+    # below request 0 or fewer rows while `len(matches) > limit` stays true
+    # for any non-negative match count, reporting `truncated: true` with 0
+    # results.
+    limit = max(0, limit)
+
     if _is_workspace_mode():
         if not project:
             return _project_required_error("find_pattern")

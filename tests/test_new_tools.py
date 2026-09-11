@@ -596,3 +596,99 @@ class TestLuaCommentImports:
     def test_a_method_named_require_is_not_an_import(self):
         """`self.require(...)` belongs to some table, not to the loader."""
         assert _extract_imports('local m = self.require("notmine")', "lua") == []
+
+
+class TestFindPatternTruncation:
+    """find_pattern must say when its list is incomplete."""
+
+    def _configure(self, db, tmp_path, monkeypatch):
+        from srclight import server as server_mod
+        monkeypatch.setattr(server_mod, "_workspace_name", None)
+        monkeypatch.setattr(server_mod, "_db", db)
+        monkeypatch.setattr(server_mod, "_db_path", tmp_path / "test.db")
+        monkeypatch.setattr(server_mod, "_repo_root", tmp_path)
+        return server_mod
+
+    def test_more_matches_than_limit_reports_truncated(self, db, tmp_path, monkeypatch):
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(5):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=3))
+
+        assert result["match_count"] == 3
+        assert result["truncated"] is True
+
+    def test_exactly_limit_matches_is_not_truncated(self, db, tmp_path, monkeypatch):
+        """The off-by-one that makes the whole feature pointless if wrong."""
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(3):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=3))
+
+        assert result["match_count"] == 3
+        assert result["truncated"] is False
+
+    def test_fewer_matches_than_limit_is_not_truncated(self, db, tmp_path, monkeypatch):
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=50))
+
+        assert result["truncated"] is False
+
+    def test_matched_lines_total_counts_lines_not_symbols(self, db, tmp_path, monkeypatch):
+        """The count the root match_count's name implies but does not hold."""
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "two_hits", start_line=1, end_line=4,
+                       content="def two_hits():\n    # TODO: a\n    # TODO: b")
+        _insert_symbol(db, fid, "one_hit", start_line=10, end_line=12,
+                       content="def one_hit():\n    # TODO: c")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=50))
+
+        assert result["match_count"] == 2            # symbols
+        assert result["matched_lines_total"] == 3    # lines
+
+    def test_offset_is_echoed_and_pages(self, db, tmp_path, monkeypatch):
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(5):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        page = json.loads(server_mod.find_pattern("TODO", limit=3, offset=3))
+
+        assert page["offset"] == 3
+        assert page["match_count"] == 2
+        assert page["truncated"] is False
+
+    def test_existing_keys_are_untouched(self, db, tmp_path, monkeypatch):
+        """The additive-only constraint, asserted rather than assumed."""
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO"))
+
+        assert {"pattern", "match_count", "file_count", "by_file"} <= set(result)
+        assert result["by_file"]["src/main.py"][0]["name"] == "only"

@@ -358,6 +358,89 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
     run_server(transport=transport, port=port)
 
 
+@main.command(
+    "tool",
+    add_help_option=False,          # so `tool <name> --help` reaches the tool
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.argument("tool_name", required=False)
+@click.option("--list", "list_tools_flag", is_flag=True, help="List every available tool")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--workspace", "-w", "workspace_name", help="Workspace name (multi-repo mode)")
+@click.pass_context
+def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
+         db_path: str | None, workspace_name: str | None):
+    """Run any MCP tool from the shell.
+
+    The tools, their arguments and their help text come from the running
+    server's own registry, so this command tracks the MCP surface exactly —
+    including across upgrades, which means a tool renamed there is renamed
+    here too.
+
+    Output is the tool's JSON on stdout and nothing else. Exit codes: 0 on
+    success, 1 when the tool reports an error, 2 on a usage error.
+    """
+    import asyncio
+
+    from .server import configure, configure_workspace, mcp
+    from .tool_dispatch import (
+        ToolArgumentError,
+        coerce_arguments,
+        format_tool_help,
+        parse_cli_pairs,
+    )
+
+    tools = asyncio.run(mcp.list_tools())
+    by_name = {t.name: t for t in tools}
+
+    if list_tools_flag or not tool_name:
+        for name in sorted(by_name):
+            summary = (by_name[name].description or "").strip().split("\n")[0]
+            click.echo(f"{name}  {summary}")
+        return
+
+    spec = by_name.get(tool_name)
+    if spec is None:
+        close = [n for n in sorted(by_name) if n.startswith(tool_name[:4])]
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        click.echo(f"Error: unknown tool '{tool_name}'.{hint} "
+                   f"Run 'srclight tool --list' to see all tools.", err=True)
+        sys.exit(2)
+
+    if "--help" in ctx.args or "-h" in ctx.args:
+        click.echo(format_tool_help(spec.name, spec.description or "", spec.input_schema))
+        return
+
+    try:
+        arguments = coerce_arguments(spec.input_schema, parse_cli_pairs(list(ctx.args)))
+    except ToolArgumentError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(2)
+
+    if workspace_name:
+        configure_workspace(workspace_name)
+    elif db_path:
+        db_file = Path(db_path).resolve()
+        configure(db_path=db_file, repo_root=_find_repo_root(db_file.parent))
+    else:
+        root = _find_repo_root(Path.cwd())
+        configure(db_path=_get_db_path(root), repo_root=root)
+
+    result = asyncio.run(mcp.call_tool(spec.name, arguments))
+    text = "\n".join(
+        block.text for block in result.content if getattr(block, "text", None) is not None
+    )
+    click.echo(text)
+
+    if getattr(result, "isError", False):
+        sys.exit(1)
+    try:
+        if isinstance(json.loads(text), dict) and "error" in json.loads(text):
+            sys.exit(1)
+    except json.JSONDecodeError:
+        pass
+
+
 # --- Workspace commands ---
 
 

@@ -131,6 +131,24 @@ srclight serve
 
 > **Note:** `srclight index` automatically adds `.srclight/` to your `.gitignore`. Index databases and embedding files can be large and should never be committed.
 
+### Running tools from the shell
+
+Every MCP tool is reachable from the CLI, which is how an agent with a
+sandbox can query the index without the answer ever entering its context:
+
+```bash
+srclight tool --list                    # every tool and what it does
+srclight tool find_pattern --help       # arguments, from the tool's own schema
+srclight tool find_pattern --pattern 'this->timer' --kind function --limit 80
+```
+
+Output is the tool's JSON on stdout and nothing else, so it pipes. Exit codes
+are 0 on success, 1 when the tool reports an error, 2 on a usage error.
+
+The command reads the server's own tool registry, so it always matches the
+tools your MCP client sees — and a tool renamed on the MCP side is renamed
+here too.
+
 ## Semantic Search (Embeddings)
 
 Srclight supports embedding-based semantic search for natural language queries like "find code that handles authentication" or "where is the database connection pool".

@@ -99,3 +99,121 @@ class TestFormatToolHelp:
         assert "find_pattern" in text
         assert "--pattern" in text and "required" in text
         assert "--limit" in text and "50" in text
+
+
+class TestToolCommand:
+    """The CLI face of the MCP registry."""
+
+    def _repo(self, tmp_path):
+        (tmp_path / "main.py").write_text(
+            "def alpha():\n    # TODO: one\n    pass\n\n\n"
+            "def beta():\n    # TODO: two\n    pass\n"
+        )
+        from click.testing import CliRunner
+        from srclight.cli import main
+        result = CliRunner().invoke(main, ["index", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+        return tmp_path
+
+    def test_list_names_every_registered_tool(self):
+        import asyncio
+        from click.testing import CliRunner
+        from srclight.cli import main
+        from srclight.server import mcp
+
+        registered = {t.name for t in asyncio.run(mcp.list_tools())}
+
+        result = CliRunner().invoke(main, ["tool", "--list"])
+
+        assert result.exit_code == 0, result.output
+        listed = {line.split()[0] for line in result.output.splitlines() if line.strip()}
+        assert registered <= listed, f"missing from --list: {registered - listed}"
+
+    def test_a_newly_registered_tool_appears_without_code_changes(self, monkeypatch):
+        """The 'it follows on its own' claim, asserted rather than believed."""
+        from click.testing import CliRunner
+        from srclight.cli import main
+        from srclight.server import mcp
+
+        @mcp.tool()
+        def a_tool_invented_by_a_test() -> str:
+            """Invented at test time."""
+            return "{}"
+
+        try:
+            result = CliRunner().invoke(main, ["tool", "--list"])
+            assert "a_tool_invented_by_a_test" in result.output
+        finally:
+            mcp.remove_tool("a_tool_invented_by_a_test")
+
+    def test_tool_help_comes_from_the_schema(self):
+        from click.testing import CliRunner
+        from srclight.cli import main
+
+        result = CliRunner().invoke(main, ["tool", "find_pattern", "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert "--pattern" in result.output and "required" in result.output
+
+    def test_dispatch_returns_the_tools_json_on_stdout(self, tmp_path):
+        import json
+        from click.testing import CliRunner
+        from srclight.cli import main
+        repo = self._repo(tmp_path)
+
+        result = CliRunner().invoke(
+            main, ["tool", "--db", str(repo / ".srclight" / "index.db"),
+                   "find_pattern", "--pattern", "TODO", "--limit", "1"]
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)     # stdout is JSON and nothing else
+        assert payload["match_count"] == 1
+        assert payload["truncated"] is True
+
+    def test_unknown_tool_exits_two_and_suggests(self):
+        from click.testing import CliRunner
+        from srclight.cli import main
+
+        result = CliRunner().invoke(main, ["tool", "find_paterns"])
+
+        assert result.exit_code == 2
+        assert "find_paterns" in result.output
+
+    def test_unknown_argument_exits_two(self, tmp_path):
+        from click.testing import CliRunner
+        from srclight.cli import main
+        repo = self._repo(tmp_path)
+
+        result = CliRunner().invoke(
+            main, ["tool", "--db", str(repo / ".srclight" / "index.db"),
+                   "find_pattern", "--pattern", "TODO", "--patern", "typo"]
+        )
+
+        assert result.exit_code == 2
+        assert "patern" in result.output
+
+    def test_missing_required_argument_exits_two(self, tmp_path):
+        from click.testing import CliRunner
+        from srclight.cli import main
+        repo = self._repo(tmp_path)
+
+        result = CliRunner().invoke(
+            main, ["tool", "--db", str(repo / ".srclight" / "index.db"), "find_pattern"]
+        )
+
+        assert result.exit_code == 2
+        assert "pattern" in result.output
+
+    def test_a_tool_error_exits_one(self, tmp_path):
+        from click.testing import CliRunner
+        from srclight.cli import main
+        repo = self._repo(tmp_path)
+
+        result = CliRunner().invoke(
+            main, ["tool", "--db", str(repo / ".srclight" / "index.db"),
+                   "find_pattern", "--pattern", "([unclosed"]
+        )
+
+        assert result.exit_code == 1
+        assert "error" in result.output

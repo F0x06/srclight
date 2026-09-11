@@ -226,6 +226,34 @@ class TestFindPattern:
         results = db.find_pattern_in_symbols(r"except\s+\w+\s+as\s+\w+")
         assert len(results) == 1
 
+    def test_offset_skips_leading_matches(self, db):
+        """offset skips matching symbols without disturbing the order."""
+        fid = _insert_file(db)
+        for i in range(10):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        everything = db.find_pattern_in_symbols("TODO", limit=10)
+        skipped = db.find_pattern_in_symbols("TODO", limit=10, offset=3)
+
+        assert [r["name"] for r in skipped] == [r["name"] for r in everything[3:]]
+
+    def test_offset_past_the_end_returns_nothing(self, db):
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        assert db.find_pattern_in_symbols("TODO", offset=5) == []
+
+    def test_offset_defaults_to_zero(self, db):
+        """The existing call signature keeps its exact behaviour."""
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        assert len(db.find_pattern_in_symbols("TODO")) == 1
+
 
 # --- find_imports tests ---
 

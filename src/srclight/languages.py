@@ -108,10 +108,41 @@ _CPP_QUERY = """
             declarator: (function_declarator
                 declarator: (identifier) @ptrfn2.name)))) @ptrfn2.def
 
+; The same wrapping hides a method: `Buffer* Pool::acquire()` is a
+; qualified_identifier under the pointer, and the in-class declaration that
+; goes with it is a field_identifier under one.
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (qualified_identifier) @ptrmethod.name))) @ptrmethod.def
+
+(function_definition
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (qualified_identifier) @ptrmethod2.name)))) @ptrmethod2.def
+
+(field_declaration
+    declarator: (pointer_declarator
+        declarator: (function_declarator
+            declarator: (field_identifier) @ptrfield_fn.name))) @ptrfield_fn.def
+
+(field_declaration
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (field_identifier) @ptrfield_fn2.name)))) @ptrfield_fn2.def
+
 (declaration
     declarator: (pointer_declarator
         declarator: (function_declarator
             declarator: (identifier) @ptrproto.name))) @ptrproto.def
+
+(declaration
+    declarator: (pointer_declarator
+        declarator: (pointer_declarator
+            declarator: (function_declarator
+                declarator: (identifier) @ptrproto2.name)))) @ptrproto2.def
 
 (class_specifier
     name: (type_identifier) @cls.name) @cls.def

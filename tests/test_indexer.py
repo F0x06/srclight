@@ -174,10 +174,24 @@ struct Buffer {
     int size;
 };
 
+struct Pool {
+    Buffer* acquire();
+    Buffer** acquire_all();
+};
+
 Buffer* buffer_create(int size);
+Buffer** buffer_table();
 
 Buffer* buffer_create(int size) {
     return new Buffer{size};
+}
+
+Buffer* Pool::acquire() {
+    return buffer_create(1);
+}
+
+Buffer** Pool::acquire_all() {
+    return 0;
 }
 ''')
 
@@ -208,6 +222,30 @@ def test_index_pointer_returning_functions(db, pointer_return_project):
     node_create = db.get_symbol_by_name("node_create")
     assert node_create is not None
     assert "node_clone" in [c["symbol"].name for c in db.get_callers(node_create.id)]
+
+
+def test_index_pointer_returning_cpp_methods(db, pointer_return_project):
+    """A pointer return type must not hide a C++ method the way it once did."""
+    config = IndexConfig(root=pointer_return_project)
+    indexer = Indexer(db, config)
+    indexer.index(pointer_return_project)
+
+    cpp_syms = db.symbols_in_file("alloc.cpp")
+
+    # Declared in the class body, defined out of line: both spellings.
+    assert {"acquire", "acquire_all", "Pool::acquire", "Pool::acquire_all"} <= {
+        s.name for s in cpp_syms if s.kind == "method"
+    }
+    # A `T**` prototype, which C already indexed and C++ did not.
+    assert "buffer_table" in {s.name for s in cpp_syms if s.kind == "prototype"}
+
+    # An edge out of a pointer-returning method exists only if the method
+    # itself became a symbol.
+    buffer_create = db.get_symbol_by_name("buffer_create")
+    assert buffer_create is not None
+    assert "Pool::acquire" in [
+        c["symbol"].name for c in db.get_callers(buffer_create.id)
+    ]
 
 
 def test_incremental_index(db, sample_project):

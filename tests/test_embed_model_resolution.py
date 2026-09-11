@@ -364,6 +364,22 @@ def test_forgetting_the_model_stops_later_runs_from_embedding(repo, stub_provide
         db.close()
 
 
+def test_forgetting_says_that_embed_was_ignored(repo, stub_provider, monkeypatch):
+    """--no-embed names the flag it overrode; forgetting must too.
+
+    Otherwise `--forget-embed-model --embed stub-model` reads as if the model
+    had been recorded and used, when it was dropped on the floor.
+    """
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+
+    result = CliRunner().invoke(
+        main, ["index", str(repo), "--forget-embed-model", "--embed", "stub-model"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "stub-model" in result.output and "ignored" in result.output
+
+
 def test_a_skipped_embedding_pass_marks_the_sidecar_stale(repo, stub_provider):
     """--no-embed still deletes and re-creates symbols; ids get reused.
 
@@ -907,6 +923,22 @@ def test_workspace_index_can_forget_every_project_model(workspace, embed_calls, 
     finally:
         db.close()
     assert embed_calls == []
+
+
+def test_workspace_forgetting_does_not_announce_the_model_it_dropped(
+        workspace, embed_calls, monkeypatch):
+    """The header printed the model as if it were in use. It is not."""
+    monkeypatch.delenv("SRCLIGHT_EMBED_MODEL", raising=False)
+
+    result = CliRunner().invoke(
+        main, ["workspace", "index", "-w", "embed-ws",
+               "--forget-embed-model", "--embed", "voyage-code-3"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert embed_calls == []
+    assert "Embedding model: voyage-code-3" not in result.output
+    assert "ignored" in result.output
 
 
 def test_workspace_index_honours_no_embed(workspace, embed_calls, monkeypatch):

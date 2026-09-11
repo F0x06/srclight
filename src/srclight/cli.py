@@ -118,7 +118,12 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     if forget_embed_model:
         db.forget_embedding_model()
         db.commit()
-        click.echo("Embedding model: forgotten — later runs will not embed")
+        note = "Embedding model: forgotten — later runs will not embed"
+        if embed_model:
+            # --no-embed names the flag it overrode; this one must too, or
+            # the run reads as if --embed had been recorded and used.
+            note += f"; --embed {embed_model} ignored"
+        click.echo(note)
 
     config = IndexConfig(
         root=root, embed_model=embed_model,
@@ -548,11 +553,14 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
             click.echo(f"Project '{project}' not found in workspace '{ws_name}'", err=True)
             sys.exit(1)
 
-    if no_embed:
+    if no_embed or forget_embed_model:
+        # Forgetting disables embeddings for the run too, so announcing
+        # --embed here would name a model that goes nowhere.
+        why = "--no-embed" if no_embed else "--forget-embed-model"
         if embed_model:
-            click.echo(f"Embeddings: skipped (--no-embed); --embed {embed_model} ignored")
+            click.echo(f"Embeddings: skipped ({why}); --embed {embed_model} ignored")
         else:
-            click.echo("Embeddings: skipped (--no-embed)")
+            click.echo(f"Embeddings: skipped ({why})")
     elif embed_model:
         click.echo(f"Embedding model: {embed_model}")
 

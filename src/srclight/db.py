@@ -1799,6 +1799,7 @@ class Database:
         language: str | None = None,
         kind: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Search for a regex pattern within symbol source code.
 
@@ -1807,6 +1808,9 @@ class Database:
         Each result carries ``match_count`` (how many lines in the symbol matched)
         and ``matched_lines`` — per matching line, its offset within the symbol,
         its absolute file line, the line text, and the substring the pattern hit.
+        ``offset`` skips that many matching symbols before collecting, so a
+        caller that was truncated can page. Ordering is stable (path, then
+        start line) as long as the index does not change between calls.
         """
         assert self.conn is not None
 
@@ -1832,6 +1836,7 @@ class Database:
 
         compiled = re.compile(pattern)
         results: list[dict[str, Any]] = []
+        seen = 0  # matching symbols passed over, including those skipped by offset
 
         for row in self.conn.execute(sql, params):
             content = row["content"]
@@ -1851,6 +1856,9 @@ class Database:
                     })
 
             if matched_lines:
+                seen += 1
+                if seen <= offset:
+                    continue
                 sym = self._row_to_symbol(row)
                 results.append({
                     "name": sym.name,

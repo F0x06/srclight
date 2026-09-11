@@ -2289,6 +2289,7 @@ def find_pattern(
     language: str | None = None,
     kind: str | None = None,
     limit: int = 50,
+    offset: int = 0,
 ) -> str:
     """Search for structural code patterns in symbol bodies.
 
@@ -2300,6 +2301,13 @@ def find_pattern(
     - The symbol name and kind containing the match
     - File path and line numbers of the symbol
     - The match context within the symbol
+
+    The response reports three counts, and they mean different things:
+    `match_count` is how many SYMBOLS are returned (capped by `limit`),
+    `matched_lines_total` is how many LINES matched inside them, and
+    `truncated` says whether more symbols existed beyond `limit`. When
+    `truncated` is true, `matched_lines_total` is a floor over what was
+    returned, not a repo-wide total — nothing here ever scans the whole index.
 
     Pattern supports regex. Common patterns:
     - "Color\\\\(0x" — find raw color literals
@@ -2315,6 +2323,9 @@ def find_pattern(
         language: Filter by language (e.g., 'python', 'javascript')
         kind: Filter by symbol kind (e.g., 'function', 'method')
         limit: Maximum results (default 50)
+        offset: Skip this many matching symbols before collecting (default 0).
+            With `truncated`, this pages through a result set larger than
+            `limit`.
     """
     import re as _re
 
@@ -2323,6 +2334,12 @@ def find_pattern(
         _re.compile(pattern)
     except _re.error as e:
         return json.dumps({"error": f"Invalid regex pattern: {e}"}, indent=2)
+
+    # Clamp before use: a negative limit would otherwise make `limit + 1`
+    # below request 0 or fewer rows while `len(matches) > limit` stays true
+    # for any non-negative match count, reporting `truncated: true` with 0
+    # results.
+    limit = max(0, limit)
 
     if _is_workspace_mode():
         if not project:
@@ -2337,11 +2354,21 @@ def find_pattern(
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        matches = db.find_pattern_in_symbols(pattern, language=language, kind=kind, limit=limit)
+        matches = db.find_pattern_in_symbols(
+            pattern, language=language, kind=kind, limit=limit + 1, offset=offset
+        )
         db.close()
     else:
         db = _get_db()
-        matches = db.find_pattern_in_symbols(pattern, language=language, kind=kind, limit=limit)
+        matches = db.find_pattern_in_symbols(
+            pattern, language=language, kind=kind, limit=limit + 1, offset=offset
+        )
+
+    # Asking for limit + 1 is how truncation is detected: holding one more than
+    # requested proves more exist. Exact, and the scan still stops early.
+    truncated = len(matches) > limit
+    matches = matches[:limit]
+    matched_lines_total = sum(m["match_count"] for m in matches)
 
     # Group by file for readability
     by_file: dict[str, list[dict]] = {}
@@ -2352,6 +2379,9 @@ def find_pattern(
     result: dict[str, object] = {
         "pattern": pattern,
         "match_count": len(matches),
+        "matched_lines_total": matched_lines_total,
+        "truncated": truncated,
+        "offset": offset,
         "file_count": len(by_file),
         "by_file": by_file,
     }

@@ -595,7 +595,7 @@ def _dashboard_html() -> str:
     }
 
     /* ================= alert (single error surface) ================= */
-    // What to type when the process is gone (BARRY): the page cannot start it.
+    // What to type when the process is gone: the page cannot start it.
     function rescueLine() {
       const wsName = (state.health && state.health.workspace) || (ws && ws.value) || '<workspace>';
       return 'If nothing supervises it, start it with: srclight serve --workspace ' + wsName + ' --web  (or: systemctl --user start srclight)';
@@ -629,7 +629,7 @@ def _dashboard_html() -> str:
       if (!h) return { level: 'err', text: 'unreachable' };
       if (h.status === 'error' || h.index_error) return { level: 'err', text: 'index error' };
       // The server spells out every reason a monitor would alert on; the
-      // header shows the first so human and machine agree (STUBBY).
+      // header shows the first so human and machine agree.
       const d = Array.isArray(h.degraded) ? h.degraded : [];
       if (d.length) return { level: 'warn', text: 'degraded · ' + d[0] + (d.length > 1 ? ' (+' + (d.length - 1) + ')' : '') };
       if (h.warming) return { level: 'warn', text: 'loading ' + h.warming };
@@ -1098,7 +1098,7 @@ def _host_of(value: str) -> str:
 def _local_only(endpoint):
     """Draw the same line for the dashboard that the MCP SDK draws for /mcp.
 
-    SAM (pack review 2026-09-01): mcp>=2 rejects foreign Host headers on /sse
+    mcp>=2 rejects foreign Host headers on /sse
     and /mcp (DNS-rebinding guard) but routes appended by add_web_routes sat
     outside it, so a rebinding page could read /api/list_projects and POST to
     /api/restart_server. A foreign Host gets 421; a POST with a foreign Origin
@@ -1227,7 +1227,7 @@ async def _api_switch_workspace(request: Request) -> Response:
     try:
         from . import server as server_mod
         # configure_workspace closes the current WorkspaceDB under its lock;
-        # off the event loop so an in-flight walk cannot freeze MCP sessions (K9).
+        # off the event loop so an in-flight walk cannot freeze MCP sessions.
         await _run_sync(server_mod.configure_workspace, name)
         return JSONResponse({"ok": True, "workspace": name})
     except Exception as e:
@@ -1427,7 +1427,7 @@ def _healthz_payload() -> dict:
 
     # `status` stays "ok" while the process can answer (liveness). Anything a
     # monitor or the header should alert on is spelled out in `degraded`, so
-    # human and machine disagree about nothing (STUBBY).
+    # human and machine disagree about nothing.
     from .workspace import warning_ring
     warnings = warning_ring.since(3600)
     payload["warnings_last_hour"] = len(warnings)
@@ -1564,7 +1564,7 @@ def add_web_routes(app: "Starlette") -> None:
 
     def _warm_stats() -> None:
         """Prime the per-project stats cache off the request path so the first
-        /healthz after a restart answers in milliseconds, not 15 s (TOTO).
+        /healthz after a restart answers in milliseconds, not 15 s.
 
         Started as a daemon thread here rather than via on_startup: the MCP
         app carries its own lifespan, and Starlette ignores on_startup

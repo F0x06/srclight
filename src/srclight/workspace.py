@@ -2,8 +2,7 @@
 
 A workspace groups multiple repos under one name. Each repo has its own
 .srclight/index.db. At query time, we ATTACH all per-repo databases to a
-:memory: connection and UNION across them — same pattern as MultiDict in
-intuition/nomad-builder.
+:memory: connection and UNION across them.
 
 Config lives at ~/.srclight/workspaces/{name}.json
 """
@@ -29,7 +28,7 @@ logger = logging.getLogger("srclight.workspace")
 class _WarningRing(logging.Handler):
     """Keeps the last few hundred WARNING+ records so /healthz can bark.
 
-    STUBBY (pack review 2026-09-01): 410 "Failed to attach" warnings went to a
+    410 "Failed to attach" warnings once went to a
     write-only journal while the dashboard stayed green. A ring buffer lets the
     health payload report `warnings_last_hour` without a log watcher.
     """
@@ -352,7 +351,7 @@ class WorkspaceDB:
             except sqlite3.DatabaseError as e:
                 # DatabaseError covers OperationalError AND "file is not a
                 # database": one corrupt index must cost one row, never the
-                # whole workspace (BARRY, pack review 2026-09-01).
+                # whole workspace.
                 self._attach_errors[entry.name] = str(e)
                 logger.warning("Failed to attach %s: %s", entry.name, e)
 
@@ -492,7 +491,7 @@ class WorkspaceDB:
                 stale.append(e)
         if stale:
             # Only a miss touches the connection, so only a miss takes the
-            # lock: a warm /healthz never queues behind a search walk (K9).
+            # lock: a warm /healthz never queues behind a search walk.
             with self._lock:
                 self._walk_stale(stale, keys, result)
         return result
@@ -511,7 +510,7 @@ class WorkspaceDB:
                 # "Indexed N ago" means the last index RUN when the signal
                 # file exists; MAX(files.indexed_at) only moves when a file
                 # is re-parsed and would call a project checked this
-                # morning "160d ago" (TOTO, pack review 2026-09-01).
+                # morning "160d ago".
                 run_ts = self._read_signal_timestamp(by_name[project_name])
                 if run_ts:
                     stats = {**stats, "last_indexed": run_ts, "last_file_change": stats["last_indexed"]}
@@ -1028,7 +1027,7 @@ class WorkspaceDB:
         comparison happens: once, when the sidecar is loaded. Without it a sidecar
         left behind by an interrupted re-embed serves a subset of the index for
         the life of the process while /api/embedding_status, which reads the DB,
-        reports 100% coverage (intuition-2019, 2026-09-02: 20,648 vs 15,611).
+        reports 100% coverage (seen on a 20k-symbol project: 20,648 vs 15,611).
         """
         db_file = srclight_dir / "index.db"
         if not db_file.exists():

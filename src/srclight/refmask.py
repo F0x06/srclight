@@ -5,7 +5,7 @@ WHY. 12.8% of sampled reference edges existed only because a symbol NAME sat in
 a comment or string (measured, srclight self-index, 2026-08-30). ctags-lineage
 tools never had this class — they tag AST nodes; Sourcegraph rejects
 isString/isComment tokens at query time. Masking at BUILD time is the cheapest
-point (grain-0399). Offsets are preserved (spaces, newlines kept) so any line
+point. Offsets are preserved (spaces, newlines kept) so any line
 math downstream stays valid. Heuristic by design — a character scanner, not a
 parser; multi-line raw-string exotica in non-python languages may over- or
 under-mask a line, which the measure gate will show if it matters.

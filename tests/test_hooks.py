@@ -350,7 +350,7 @@ def test_hook_still_runs_on_linux(tmp_path, tmp_path_factory):
 
 
 
-# --- post-ship review (council 9286392f) ---------------------------------------------
+# --- silent-failure paths found after 0.25.0 ------------------------------------------
 
 
 def test_content_after_block_still_runs(tmp_path, tmp_path_factory):

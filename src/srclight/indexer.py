@@ -1492,7 +1492,7 @@ class Indexer:
 
         def _select_targets(targets: list[dict], source_file: str,
                             imported: set[str], ref_name: str) -> tuple[list[dict], str]:
-            """Ranked, field-standard selection (grain-0399): prefer evidence,
+            """Ranked, field-standard selection: prefer evidence,
             and when none discriminates, keep the ranked LIST as name_only —
             a labeled candidate list beats a fabricated winner."""
             same_file = [t for t in targets if t["file"] == source_file]

@@ -584,11 +584,22 @@ exit 0
 
 
 def _write_hook_file(hook_file: Path, snippet: str) -> bool:
-    """Write snippet into a hook file. Returns True if newly installed, False if already present."""
+    """Write snippet into a hook file. Returns True if installed or updated, False if already current."""
     if hook_file.exists():
         existing = hook_file.read_text()
         if _HOOK_MARKER_START in existing:
-            return False
+            import re as _re
+            block = _re.compile(
+                _re.escape(_HOOK_MARKER_START) + r".*?" + _re.escape(_HOOK_MARKER_END),
+                _re.DOTALL,
+            ).search(existing)
+            if block is None or block.group(0) == snippet:
+                return False
+            # An older block, usually guarding on a binary path from before the
+            # checkout moved: its `[ -x ]` test fails and the hook does nothing.
+            hook_file.write_text(existing[:block.start()] + snippet + existing[block.end():])
+            hook_file.chmod(0o755)
+            return True
         # Remove legacy (codelight) hook if present, then install new one
         if _LEGACY_MARKER_START in existing:
             import re as _re
@@ -913,8 +924,19 @@ def hook_status(ws_name: str | None):
         statuses = []
         for hook_name in _HOOK_NAMES:
             hf = hooks_dir / hook_name
-            if hf.exists() and (_HOOK_MARKER_START in hf.read_text()
-                                or _LEGACY_MARKER_START in hf.read_text()):
+            if not hf.exists():
+                continue
+            text = hf.read_text()
+            if _HOOK_MARKER_START not in text and _LEGACY_MARKER_START not in text:
+                continue
+            # The hook exits 0 whether or not its binary exists, so a marker
+            # alone does not mean auto-reindex runs.
+            import os
+            import re as _re
+            target = _re.search(r'\[ -x "([^"]+)" \]', text)
+            if target and not os.access(target.group(1), os.X_OK):
+                statuses.append(f"{hook_name} (STALE: {target.group(1)} not executable)")
+            else:
                 statuses.append(hook_name)
         if statuses:
             click.echo(f"  {name:<20} {', '.join(statuses)}")

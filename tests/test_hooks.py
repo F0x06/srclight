@@ -11,7 +11,10 @@ from srclight.cli import (
     _HOOK_MARKER_START,
     _install_hooks_in_repo,
     _uninstall_hooks_in_repo,
+    hook_status,
 )
+
+STALE_BIN = "/home/nobody/Projects/srclight/.venv/bin/srclight"
 
 
 @pytest.fixture
@@ -142,3 +145,48 @@ def test_hooks_use_flock(fake_repo):
     for name in ("post-commit", "post-checkout"):
         content = (fake_repo / ".git" / "hooks" / name).read_text()
         assert "flock -n" in content, f"{name} hook missing 'flock -n'"
+
+
+def test_install_rewrites_block_pointing_at_old_binary(fake_repo):
+    """A moved checkout left hooks guarding on a path that no longer exists.
+
+    The block's `[ -x ]` test fails, the hook exits 0, and auto-reindex is
+    silently off. Reinstalling has to replace the block, not skip it because
+    the marker is present.
+    """
+    pc = fake_repo / ".git" / "hooks" / "post-commit"
+    pc.write_text("#!/bin/sh\necho 'user hook'\n")
+    _install_hooks_in_repo(fake_repo, STALE_BIN)
+
+    result = _install_hooks_in_repo(fake_repo, "/usr/bin/srclight")
+    assert "OK" in result
+
+    content = pc.read_text()
+    assert STALE_BIN not in content
+    assert '"/usr/bin/srclight" index .' in content
+    assert content.count(_HOOK_MARKER_START) == 1
+    assert content.count(_HOOK_MARKER_END) == 1
+    assert "user hook" in content
+
+
+def test_status_flags_block_whose_binary_is_missing(fake_repo, monkeypatch):
+    from click.testing import CliRunner
+
+    _install_hooks_in_repo(fake_repo, STALE_BIN)
+    monkeypatch.chdir(fake_repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "STALE" in out
+    assert STALE_BIN in out
+
+
+def test_status_ok_when_binary_exists(fake_repo, monkeypatch, tmp_path_factory):
+    from click.testing import CliRunner
+
+    bin_path = tmp_path_factory.mktemp("bin") / "srclight"
+    bin_path.write_text("#!/bin/sh\n")
+    bin_path.chmod(0o755)
+    _install_hooks_in_repo(fake_repo, str(bin_path))
+    monkeypatch.chdir(fake_repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "post-commit, post-checkout" in out
+    assert "STALE" not in out

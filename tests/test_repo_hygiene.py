@@ -126,6 +126,23 @@ def test_no_tracked_absolute_path_symlinks():
     )
 
 
+# SHA-256 of private project names that must not appear in public files. Stored
+# as digests so this public test does not itself publish the names it guards.
+_PRIVATE_NAME_DIGESTS = frozenset({
+    "673a605c07170e3658d3a0ad65e6906ab69d29a32a298bc4948c45b2bb9fafa0",
+    "de3b36a9bec2cba05045f708b07fb4f3df42b2b251148ef6e3a550dbee38afcd",
+})
+_WORD = re.compile(r"[a-z0-9][a-z0-9_-]*")
+
+
+def _names_private_project(line: str) -> bool:
+    import hashlib
+    return any(
+        hashlib.sha256(word.encode()).hexdigest() in _PRIVATE_NAME_DIGESTS
+        for word in _WORD.findall(line.lower())
+    )
+
+
 @pytest.mark.skipif(
     shutil.which("git") is None or not (REPO_ROOT / ".git").exists(),
     reason="Not a git checkout (e.g. installed from an sdist tarball)",
@@ -160,6 +177,6 @@ def test_no_private_workstation_references_in_tracked_text():
         except (UnicodeDecodeError, FileNotFoundError):
             continue
         for n, line in enumerate(text.splitlines(), 1):
-            if any(p.search(line) for p in patterns):
+            if any(p.search(line) for p in patterns) or _names_private_project(line):
                 offenders.append(f"  {rel}:{n}: {line.strip()[:120]}")
     assert not offenders, "Private references in tracked public files:\n" + "\n".join(offenders)

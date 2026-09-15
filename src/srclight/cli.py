@@ -989,7 +989,9 @@ def _ensure_srclight_ignored(repo_path: Path) -> None:
     tracked .gitignore dirtied third-party clones and rewrote CRLF files on
     every hook run.
     """
-    out = _git(repo_path, "check-ignore", "-q", ".srclight/index.db")
+    # Probe a name no generic pattern matches: a repo that ignores `*.db` would
+    # report .srclight/index.db ignored while embeddings.npy stays untracked.
+    out = _git(repo_path, "check-ignore", "-q", ".srclight/.srclight-ignore-probe")
     if out is not None and out.returncode == 0:
         return
     exclude = _git_path(repo_path, "info/exclude")

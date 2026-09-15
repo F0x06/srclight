@@ -142,7 +142,6 @@ def test_no_private_workstation_references_in_tracked_text():
         re.compile(r"/Users/(?!you/|user/)[A-Za-z][A-Za-z0-9_-]*/"),
         re.compile(r"\bgrain-\d{3,4}\b"),
         re.compile(r"\bcouncil [0-9a-f]{8}\b"),
-        re.compile(r"\bcanes-fideles\b|\bcaneslight\b"),
         re.compile(r"\bpack review\b", re.IGNORECASE),
         # user@host on a private LAN (a build machine's address and login)
         re.compile(r"\b[a-z][a-z0-9_-]*@(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b"),

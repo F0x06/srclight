@@ -527,3 +527,16 @@ def test_healthz_hook_problems_lists_unhealthy_repos(tmp_path, monkeypatch, tmp_
     problems = web._hook_health_problems("ws")
     assert len(problems) == 1 and problems[0].startswith("bad:") and "STALE" in problems[0]
     assert web._hook_health_problems(None) == []
+
+
+def test_ensure_ignored_not_fooled_by_generic_patterns(tmp_path, tmp_path_factory):
+    """A repo ignoring *.db and *.log still needs .srclight/ excluded, or embeddings.npy shows as untracked."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("*.db\n*.log\n")
+    subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
+    _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    for name in ("index.db", "reindex.log", "embeddings.npy", "embeddings_meta.json"):
+        (repo / ".srclight" / name).write_text("x")
+    st = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+    assert ".srclight" not in st, st

@@ -124,3 +124,43 @@ def test_no_tracked_absolute_path_symlinks():
         "Tracked absolute-path symlinks found (will dangle on every clone):\n"
         + "\n".join(f"  {p} -> {t}" for p, t in offenders)
     )
+
+
+@pytest.mark.skipif(
+    shutil.which("git") is None or not (REPO_ROOT / ".git").exists(),
+    reason="Not a git checkout (e.g. installed from an sdist tarball)",
+)
+def test_no_private_workstation_references_in_tracked_text():
+    """This repository and its PyPI packages are public.
+
+    Home-directory paths and private review bookkeeping (review-log entry ids
+    and review-session names) reached shipped code comments before this guard
+    existed. The rationale belongs in the comment; where it was decided does not.
+    """
+    patterns = [
+        re.compile(r"/home/(?!you/|user/|nobody/|runner/)[a-z][a-z0-9_-]*/"),
+        re.compile(r"/Users/(?!you/|user/)[A-Za-z][A-Za-z0-9_-]*/"),
+        re.compile(r"\bgrain-\d{3,4}\b"),
+        re.compile(r"\bcouncil [0-9a-f]{8}\b"),
+        re.compile(r"\bcanes-fideles\b|\bcaneslight\b"),
+        re.compile(r"\bpack review\b", re.IGNORECASE),
+        # user@host on a private LAN (a build machine's address and login)
+        re.compile(r"\b[a-z][a-z0-9_-]*@(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b"),
+    ]
+    files = subprocess.run(
+        ["git", "ls-files", "--", "src", "tests", "docs", "scripts", "packaging",
+         "README.md", "pyproject.toml", "glama.json", "server.json"],
+        cwd=REPO_ROOT, check=True, capture_output=True, text=True,
+    ).stdout.split()
+    offenders = []
+    for rel in files:
+        if rel == "tests/test_repo_hygiene.py" or rel.startswith("tests/fixtures/"):
+            continue
+        try:
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if any(p.search(line) for p in patterns):
+                offenders.append(f"  {rel}:{n}: {line.strip()[:120]}")
+    assert not offenders, "Private references in tracked public files:\n" + "\n".join(offenders)

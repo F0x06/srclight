@@ -121,7 +121,7 @@ def test_dashboard_aliases_redirect_to_root(client, path):
 def test_dashboard_polls_do_not_count_as_agent_queries(client):
     """The page's own /healthz and /api/* polls must not sign the guest book.
 
-    TOTO/STUBBY/SAM/GROMIT (pack review 2026-09-01): /healthz -> codebase_map()
+    /healthz -> codebase_map()
     -> _record_query() made "last query 3s ago" the dashboard's own pulse and
     "connected" theatre.
     """
@@ -133,7 +133,7 @@ def test_dashboard_polls_do_not_count_as_agent_queries(client):
 
 
 def test_dashboard_routes_reject_foreign_host_and_origin(client):
-    """DNS-rebinding guard, same line the MCP SDK draws for /sse and /mcp (SAM)."""
+    """DNS-rebinding guard, same line the MCP SDK draws for /sse and /mcp."""
     assert client.get("/healthz", headers={"host": "attacker.example"}).status_code == 421
     assert client.get("/api/list_projects", headers={"host": "attacker.example:8742"}).status_code == 421
     assert client.get("/healthz", headers={"host": "localhost:8742"}).status_code == 200
@@ -147,7 +147,7 @@ def test_dashboard_routes_reject_foreign_host_and_origin(client):
 
 
 def test_corrupt_index_costs_one_row_not_the_workspace(tmp_path, ws_dir):
-    """BARRY path 7: one bad index.db must be one red pill, not a dead workspace."""
+    """One bad index.db must be one red pill, not a dead workspace."""
     from srclight import server as server_mod
     from srclight.web import add_web_routes
     config = WorkspaceConfig(name="corrupt-test")
@@ -173,7 +173,7 @@ def test_corrupt_index_costs_one_row_not_the_workspace(tmp_path, ws_dir):
 
 
 def test_last_indexed_prefers_the_index_run_signal(tmp_path, ws_dir):
-    """"Indexed 160d ago" must mean the last index RUN, not the last file re-parse (TOTO)."""
+    """"Indexed 160d ago" must mean the last index RUN, not the last file re-parse."""
     import json as _json
     config = WorkspaceConfig(name="signal-test")
     proj = _create_indexed_project(tmp_path, "sig", [("A", "class")])
@@ -186,7 +186,7 @@ def test_last_indexed_prefers_the_index_run_signal(tmp_path, ws_dir):
 
 
 def test_recent_queries_ledger_records_agent_calls_not_dashboard_polls(client):
-    """TOGO: the one thing only an agent index can show is what agents asked."""
+    """The one thing only an agent index can show is what agents asked."""
     from srclight import server as server_mod
     # An MCP-style call (not through the dashboard context) lands in the ledger.
     server_mod.search_symbols("Class0")
@@ -206,7 +206,7 @@ def test_recent_queries_ledger_records_agent_calls_not_dashboard_polls(client):
 
 
 def test_warm_stats_do_not_wait_for_the_workspace_lock(tmp_path, ws_dir):
-    """K9 (SEV-1): searches hold the workspace lock for seconds; a warm /healthz
+    """Searches hold the workspace lock for seconds; a warm /healthz
     must answer from the cache without queueing behind them."""
     import threading
     config = WorkspaceConfig(name="convoy-test")
@@ -226,7 +226,7 @@ def test_warm_stats_do_not_wait_for_the_workspace_lock(tmp_path, ws_dir):
 
 
 def test_project_indexed_after_open_is_picked_up(tmp_path, ws_dir):
-    """K9 (SEV-2): the app's add-then-index flow must not need a restart."""
+    """The app's add-then-index flow must not need a restart."""
     config = WorkspaceConfig(name="late-index-test")
     proj = _create_indexed_project(tmp_path, "early", [("A", "class")])
     config.add_project("early", str(proj))
@@ -241,7 +241,7 @@ def test_project_indexed_after_open_is_picked_up(tmp_path, ws_dir):
 
 
 def test_find_imports_works_in_workspace_mode(client):
-    """K9 (SEV-1): ProjectEntry has .path, not .root; the tool raised AttributeError."""
+    """ProjectEntry has .path, not .root; the tool raised AttributeError."""
     from srclight import server as server_mod
     import json as _json
     out = _json.loads(server_mod.find_imports("src/proj0.cs", project="proj0"))
@@ -253,7 +253,7 @@ def test_find_imports_works_in_workspace_mode(client):
 def test_stale_sidecar_reaches_healthz_degraded(tmp_path, ws_dir):
     """A sidecar serving only part of its index must reach the header.
 
-    intuition-2019 (found live 2026-09-02): index.db held 20,648 embeddings and
+    Found live on a 20k-symbol project: index.db held 20,648 embeddings and
     the sidecar 15,611. /api/embedding_status reads the DB and reported 100%
     coverage while semantic search reads the sidecar and saw 76% of the repo.
     Two surfaces, one of them silently wrong, and `degraded` was empty.

@@ -492,9 +492,9 @@ The MCP Python SDK's FastMCP drops arguments that are not in a tool's signature,
 error. Measured on this server:
 
 ```
-search_symbols(query="main", project="zhcorpus")    ->  20 hits, all from zhcorpus
-search_symbols(query="main", projects="zhcorpus")   ->  20 hits, ZERO from zhcorpus
-                                                        (19 from "bible", 1 from "bank-scraper")
+search_symbols(query="main", project="project-a")    ->  20 hits, all from project-a
+search_symbols(query="main", projects="project-a")   ->  20 hits, ZERO from project-a
+                                                         (19 from "project-b", 1 from "project-c")
 ```
 
 One added letter. No error, identical hit count, identical result shape, real symbols — from repos

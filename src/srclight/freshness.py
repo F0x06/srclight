@@ -3,8 +3,8 @@
 
 WHY THIS EXISTS. An index that cannot say it is fresh gets grepped around: on a
 repo under active edit, an agent falls back to grep because a silently stale
-answer is worse than a slow one (canes-fideles grain-0393, 2026-08-30 — the
-same stale-server lesson mcpkit closed for MCP daemons, applied to the index).
+answer is worse than a slow one (the same stale-server lesson mcpkit closed
+for MCP daemons, applied to the index).
 
 READ-ONLY BY DESIGN. Checking freshness never mutates the index — no hash
 refresh, no mtime touch-up. A checker that writes is an indexer.

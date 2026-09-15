@@ -129,7 +129,7 @@ srclight symbols src/main.py
 srclight serve
 ```
 
-> **Note:** `srclight index` automatically adds `.srclight/` to your `.gitignore`. Index databases and embedding files can be large and should never be committed.
+> **Note:** `srclight index` keeps `.srclight/` out of git through the repo's local `.git/info/exclude` (it never edits your tracked `.gitignore`). Index databases and embedding files can be large and should never be committed.
 
 ### Running tools from the shell
 

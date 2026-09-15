@@ -1462,8 +1462,51 @@ def _healthz_payload() -> dict:
         )
     if warnings:
         degraded.append(f"{len(warnings)} workspace warning(s) in the last hour")
+
+    # Auto-reindex hooks fail silently by design (a hook must never break a
+    # commit), so the only place a dead hook can surface is here.
+    try:
+        hook_problems = _hook_health_problems(server_mod._workspace_name)
+    except Exception as e:  # noqa: BLE001 -- health must answer, not raise
+        hook_problems = [f"hook check failed: {e}"]
+    payload["hooks"] = {"unhealthy": hook_problems}
+    if hook_problems:
+        degraded.append(
+            f"{len(hook_problems)} repo(s) whose auto-reindex hooks will not run as installed: "
+            + "; ".join(hook_problems[:3])
+        )
     payload["degraded"] = degraded
     return payload
+
+
+_HOOK_HEALTH_TTL = 300.0
+_hook_health_cache: tuple | None = None
+
+
+def _hook_health_problems(workspace_name: str | None) -> list[str]:
+    """Workspace repos whose srclight hooks will not run as installed.
+
+    Cached for five minutes: the check costs a few git calls per repo and only
+    changes when someone installs or moves something. The cache tuple is
+    replaced whole, so no reader sees half an update and no lock is taken.
+    """
+    global _hook_health_cache
+    now = time.monotonic()
+    cached = _hook_health_cache
+    if cached is not None and cached[1] == workspace_name and now - cached[0] < _HOOK_HEALTH_TTL:
+        return cached[2]
+    problems: list[str] = []
+    if workspace_name:
+        from pathlib import Path as _Path
+
+        from .cli import _repo_hook_health
+        from .workspace import WorkspaceConfig
+        for entry in WorkspaceConfig.load(workspace_name).get_entries():
+            healthy, summary = _repo_hook_health(_Path(entry.path))
+            if not healthy:
+                problems.append(f"{entry.name}: {summary}")
+    _hook_health_cache = (now, workspace_name, problems)
+    return problems
 
 
 async def _api_recent_queries(request: Request) -> Response:

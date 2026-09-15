@@ -641,7 +641,7 @@ def search_symbols(
     Args:
         query: Search query — can be a symbol name, code fragment, or natural language
         kind: Optional filter: 'function', 'class', 'method', 'struct', 'enum', etc.
-        project: Optional project filter (workspace mode only, e.g. 'intuition')
+        project: Optional project filter (workspace mode only, e.g. 'my-app')
         limit: Max results to return (default 20)
     """
     _record_query(tool="search_symbols", query=query, project=project)

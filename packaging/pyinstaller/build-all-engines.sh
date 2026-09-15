@@ -7,15 +7,16 @@
 # and optionally Windows (manual step — printed instructions).
 #
 # Output: srclight-app/dist/engine-{linux,macos,windows}/
-# These directories are referenced by loqu8-app.yaml data entries and
-# injected into platform-specific archives by release.sh step 4.
+# These directories are referenced by the desktop app's release config and
+# injected into platform-specific archives by its release pipeline.
 #
 # Usage:
 #   ./packaging/pyinstaller/build-all-engines.sh [options]
 #
 # Options:
 #   --app-dir PATH    Path to srclight-app (default: ../srclight-app relative to repo)
-#   --mac-host HOST   Mac Mini SSH host (default: tim@10.1.10.103)
+#   --mac-host HOST   macOS build host for SSH, e.g. user@mac.local
+#                     (default: $SRCLIGHT_MAC_HOST; required unless --skip-macos)
 #   --mac-repo PATH   Srclight repo on Mac (default: ~/repos/srclight/srclight)
 #   --skip-linux      Skip Linux engine build
 #   --skip-macos      Skip macOS engine build
@@ -35,7 +36,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Defaults
 APP_DIR=""
-MAC_HOST="tim@10.1.10.103"
+MAC_HOST="${SRCLIGHT_MAC_HOST:-}"
 MAC_REPO="\$HOME/repos/srclight/srclight"
 DO_LINUX=true
 DO_MACOS=true
@@ -58,6 +59,11 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+if [[ "$DO_MACOS" == true && -z "$MAC_HOST" ]]; then
+    echo "ERROR: no macOS build host. Pass --mac-host user@host or set SRCLIGHT_MAC_HOST (or use --skip-macos)."
+    exit 1
+fi
 
 # Auto-detect app dir
 if [[ -z "$APP_DIR" ]]; then
@@ -201,5 +207,5 @@ if [[ $ERRORS -gt 0 ]]; then
 fi
 
 echo ""
-echo "Next: run release.sh to build installers with engines injected."
-echo "  loqu8-dart/tool/release.sh $APP_DIR VERSION --skip-git --skip-upload"
+echo "Next: run the desktop app's release pipeline to build installers with these engines injected."
+echo "  app dir: $APP_DIR"

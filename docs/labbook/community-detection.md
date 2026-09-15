@@ -15,15 +15,15 @@ Workspace edge counts across repos (srclight's `symbol_edges` table, `edge_type=
 | Repo | Symbols | Call Edges |
 |------|---------|------------|
 | bitcoin | 29,287 | 196,920 |
-| nomad-builder | 39,424 | 77,442 |
-| intuition-2019 | 20,648 | 63,126 |
-| motacoin | 14,479 | 47,778 |
-| kumquat | 3,978 | 18,665 |
-| qi | 6,323 | 16,249 |
-| web | 22,525 | 13,622 |
+| C++ build system | 39,424 | 77,442 |
+| legacy C# desktop app | 20,648 | 63,126 |
+| altcoin fork | 14,479 | 47,778 |
+| legacy C# library | 3,978 | 18,665 |
+| legacy C# service | 6,323 | 16,249 |
+| web frontend | 22,525 | 13,622 |
 | srclight | 1,008 | 4,044 |
-| zhcorpus | 3,758 | 3,037 |
-| ice | 4,043 | 2,802 |
+| Python corpus tool | 3,758 | 3,037 |
+| Flutter desktop app | 4,043 | 2,802 |
 
 ### Hypothesis
 
@@ -117,7 +117,7 @@ BFS from top entry points, max depth 10, max branching 4. Deduplicate subset flo
    - Small graphs (<1K nodes): resolution=1.5 for finer granularity
    - Large graphs (>10K nodes): resolution=1.0 (current default)
 
-4. **Next experiment:** Run on nomad-builder (C++ heavy, 77K edges) to test
+4. **Next experiment:** Run on C++ build system (C++ heavy, 77K edges) to test
    language-specific quality.
 
 ---

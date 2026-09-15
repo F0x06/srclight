@@ -375,7 +375,7 @@ def test_stale_sidecar_is_reported_not_silently_trusted(tmp_path, ws_dir):
     workspace.vector_search skips is_valid() to save a SQLite connect per query,
     so a sidecar left behind by an interrupted re-embed serves a subset of the
     index for the life of the process while the dashboard, which reads the DB,
-    reports 100% coverage. Found live on 2026-09-02: intuition-2019 had 20,648
+    reports 100% coverage. Found live on a 20k-symbol project: 20,648
     embeddings in index.db and 15,611 rows in the sidecar.
     """
     from srclight.embeddings import vector_to_bytes
@@ -661,7 +661,7 @@ def _project_with_all_three(tmp_path: Path, name: str) -> Path:
 def test_every_fts_leg_is_reachable(tmp_path, ws_dir, token, expected_source):
     """All three legs carried the same qualifier bug; only content had a test.
 
-    TOTO's mutation review (2026-09-02): reverting the name-leg or docs-leg
+    A mutation review found that reverting the name-leg or docs-leg
     qualifier left the suite green at 321 passed. The name leg is Tier 1, which
     every plain symbol-name query hits, and the docs leg is the one that carries
     the SQLITE_MAX_ATTACHED hit cited as proof the bug was real.
@@ -721,7 +721,7 @@ def test_a_dead_fts_leg_keeps_reporting_while_it_stays_dead(tmp_path, ws_dir, ca
     warning_ring windows by the hour (web.py: warning_ring.since(3600)). Warning
     once per (schema, leg) forever meant a permanently dead leg showed on
     /healthz for 60 minutes and the dashboard went green afterwards while the
-    leg was still dead — STUBBY's ring defeated one layer up (SAM, 2026-09-02).
+    leg was still dead — the warning ring defeated one layer up.
     """
     import logging
 
@@ -759,7 +759,7 @@ def test_attach_batch_actually_calls_the_verifier(tmp_path, ws_dir, monkeypatch)
 
     A test that calls _verify_attachment directly still passes when the call
     site is deleted from _attach_batch — the function is covered and its wiring
-    is not (TOTO/K9 mutation review). Drive it through the real path instead.
+    is not. Drive it through the real path instead.
     """
     proj = _project_with_content(
         tmp_path, "alpha", "handler", "def handler():\n    return ZORBLAXSENTINEL\n"

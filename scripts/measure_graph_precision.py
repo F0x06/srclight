@@ -2,8 +2,8 @@
 # scripts/measure_graph_precision.py
 """Measure the reference graph's real precision BEFORE investing in AST resolution.
 
-Decision harness, not product code (canes-fideles grain-0395: the graph is a
-name-match heuristic — measure how wrong it actually is before rebuilding it).
+Decision harness, not product code: the graph is a name-match heuristic, so
+measure how wrong it actually is before rebuilding it.
 Reads an index.db, never writes. Reports:
   * ambiguity: fraction of edges whose target NAME maps to >1 symbol
   * comment/string-only references: sampled edges whose name occurrence in the

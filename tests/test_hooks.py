@@ -11,7 +11,10 @@ from srclight.cli import (
     _HOOK_MARKER_START,
     _install_hooks_in_repo,
     _uninstall_hooks_in_repo,
+    hook_status,
 )
+
+STALE_BIN = "/home/nobody/Projects/srclight/.venv/bin/srclight"
 
 
 @pytest.fixture
@@ -142,3 +145,156 @@ def test_hooks_use_flock(fake_repo):
     for name in ("post-commit", "post-checkout"):
         content = (fake_repo / ".git" / "hooks" / name).read_text()
         assert "flock -n" in content, f"{name} hook missing 'flock -n'"
+
+
+def test_install_rewrites_block_pointing_at_old_binary(fake_repo):
+    """A moved checkout left hooks guarding on a path that no longer exists.
+
+    The block's `[ -x ]` test fails, the hook exits 0, and auto-reindex is
+    silently off. Reinstalling has to replace the block, not skip it because
+    the marker is present.
+    """
+    pc = fake_repo / ".git" / "hooks" / "post-commit"
+    pc.write_text("#!/bin/sh\necho 'user hook'\n")
+    _install_hooks_in_repo(fake_repo, STALE_BIN)
+
+    result = _install_hooks_in_repo(fake_repo, "/usr/bin/srclight")
+    assert "OK" in result
+
+    content = pc.read_text()
+    assert STALE_BIN not in content
+    assert '"/usr/bin/srclight" index .' in content
+    assert content.count(_HOOK_MARKER_START) == 1
+    assert content.count(_HOOK_MARKER_END) == 1
+    assert "user hook" in content
+
+
+def test_status_flags_block_whose_binary_is_missing(fake_repo, monkeypatch):
+    from click.testing import CliRunner
+
+    _install_hooks_in_repo(fake_repo, STALE_BIN)
+    monkeypatch.chdir(fake_repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "STALE" in out
+    assert STALE_BIN in out
+
+
+def test_status_ok_when_binary_exists(fake_repo, monkeypatch, tmp_path_factory):
+    from click.testing import CliRunner
+
+    bin_path = tmp_path_factory.mktemp("bin") / "srclight"
+    bin_path.write_text("#!/bin/sh\n")
+    bin_path.chmod(0o755)
+    _install_hooks_in_repo(fake_repo, str(bin_path))
+    monkeypatch.chdir(fake_repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "post-commit, post-checkout" in out
+    assert "STALE" not in out
+
+
+def _exe(tmp_path_factory, name="srclight"):
+    p = tmp_path_factory.mktemp("bin") / name
+    p.write_text("#!/bin/sh\n")
+    p.chmod(0o755)
+    return str(p)
+
+
+def test_install_keeps_working_block_for_other_binary(fake_repo, tmp_path_factory):
+    """Last-writer-wins would let a uvx or frozen-engine install re-point every hook."""
+    first = _exe(tmp_path_factory)
+    second = _exe(tmp_path_factory)
+    _install_hooks_in_repo(fake_repo, first)
+    result = _install_hooks_in_repo(fake_repo, second)
+    assert "SKIP" in result
+    assert first in (fake_repo / ".git" / "hooks" / "post-commit").read_text()
+
+
+def test_install_force_rewrites_working_block(fake_repo, tmp_path_factory):
+    first = _exe(tmp_path_factory)
+    second = _exe(tmp_path_factory)
+    _install_hooks_in_repo(fake_repo, first)
+    result = _install_hooks_in_repo(fake_repo, second, force=True)
+    assert "OK" in result
+    content = (fake_repo / ".git" / "hooks" / "post-commit").read_text()
+    assert second in content and first not in content
+
+
+def test_cli_install_refuses_non_executable_binary(fake_repo, monkeypatch):
+    """The `python -m srclight.cli` fallback can never pass the hook's [ -x ] test."""
+    from click.testing import CliRunner
+    from srclight import cli
+
+    monkeypatch.setattr(cli, "_srclight_bin", lambda: "/usr/bin/python3 -m srclight.cli")
+    monkeypatch.chdir(fake_repo)
+    res = CliRunner().invoke(cli.hook_install, [])
+    assert res.exit_code == 1
+    assert not (fake_repo / ".git" / "hooks" / "post-commit").exists()
+
+
+def test_status_reads_target_inside_block_only(fake_repo, monkeypatch, tmp_path_factory):
+    from click.testing import CliRunner
+
+    pc = fake_repo / ".git" / "hooks" / "post-commit"
+    pc.write_text('#!/bin/sh\n[ -x "/nonexistent/user-tool" ] && /nonexistent/user-tool\n')
+    _install_hooks_in_repo(fake_repo, _exe(tmp_path_factory))
+    monkeypatch.chdir(fake_repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "STALE" not in out
+
+
+def test_status_flags_missing_end_marker(fake_repo, monkeypatch):
+    from click.testing import CliRunner
+
+    pc = fake_repo / ".git" / "hooks" / "post-commit"
+    pc.write_text(f"#!/bin/sh\n{_HOOK_MARKER_START}\necho half a block\n")
+    monkeypatch.chdir(fake_repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "BROKEN" in out
+
+
+def _git_repo(tmp_path):
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    return tmp_path
+
+
+def test_install_follows_core_hookspath(tmp_path, tmp_path_factory):
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    custom = tmp_path / "custom-hooks"
+    custom.mkdir()
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", str(custom)], check=True)
+    result = _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    assert "OK" in result
+    assert (custom / "post-commit").exists()
+    assert not (repo / ".git" / "hooks" / "post-commit").exists()
+
+
+def test_install_and_status_report_missing_hookspath(tmp_path, monkeypatch, tmp_path_factory):
+    """A hooksPath left at a moved directory means git runs no hooks at all."""
+    import subprocess
+    from click.testing import CliRunner
+
+    repo = _git_repo(tmp_path / "repo")
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "core.hooksPath", "/nonexistent/Projects/x/.git/hooks"],
+        check=True,
+    )
+    result = _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    assert "FAIL" in result and "core.hooksPath" in result
+    monkeypatch.chdir(repo)
+    out = CliRunner().invoke(hook_status, []).output
+    assert "STALE" in out and "core.hooksPath" in out
+
+
+def test_hook_logs_missing_binary(tmp_path):
+    """The hook must leave a trace in reindex.log when its binary is gone."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".srclight").mkdir()
+    _install_hooks_in_repo(repo, STALE_BIN)
+    r = subprocess.run(["sh", str(repo / ".git" / "hooks" / "post-commit")],
+                       cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0
+    log = (repo / ".srclight" / "reindex.log").read_text()
+    assert STALE_BIN in log and "not executable" in log

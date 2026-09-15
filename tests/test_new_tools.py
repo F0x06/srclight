@@ -226,6 +226,34 @@ class TestFindPattern:
         results = db.find_pattern_in_symbols(r"except\s+\w+\s+as\s+\w+")
         assert len(results) == 1
 
+    def test_offset_skips_leading_matches(self, db):
+        """offset skips matching symbols without disturbing the order."""
+        fid = _insert_file(db)
+        for i in range(10):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        everything = db.find_pattern_in_symbols("TODO", limit=10)
+        skipped = db.find_pattern_in_symbols("TODO", limit=10, offset=3)
+
+        assert [r["name"] for r in skipped] == [r["name"] for r in everything[3:]]
+
+    def test_offset_past_the_end_returns_nothing(self, db):
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        assert db.find_pattern_in_symbols("TODO", offset=5) == []
+
+    def test_offset_defaults_to_zero(self, db):
+        """The existing call signature keeps its exact behaviour."""
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        assert len(db.find_pattern_in_symbols("TODO")) == 1
+
 
 # --- find_imports tests ---
 
@@ -332,6 +360,26 @@ class TestExtractImports:
         modules = [i["module"] for i in imports]
         assert "kotlin.collections.List" in modules
         assert "com.example.Utils" in modules
+
+    def test_lua_require(self):
+        content = 'local json = require("dkjson")\nrequire "socket"'
+        imports = _extract_imports(content, "lua")
+        modules = [i["module"] for i in imports]
+        assert "dkjson" in modules
+        assert "socket" in modules
+
+    def test_lua_include(self):
+        """Hosts that embed Lua often load files with include/AddCSLuaFile."""
+        content = 'include("lib/validate.lua")\nAddCSLuaFile("cl_init.lua")'
+        imports = _extract_imports(content, "lua")
+        modules = [i["module"] for i in imports]
+        assert "lib/validate" in modules
+        assert "cl_init" in modules
+
+    def test_lua_require_needs_a_word_boundary(self):
+        """`myrequire(...)` is somebody else's function, not an import."""
+        imports = _extract_imports('local x = myrequire("dkjson")', "lua")
+        assert imports == []
 
     def test_unsupported_language_returns_empty(self):
         imports = _extract_imports("some content", "markdown")
@@ -493,3 +541,216 @@ class TestFindImportsIntegration:
         modules = [i["module"] for i in raw_imports]
         assert "stdio.h" in modules
         assert "mylib.h" in modules
+
+
+class TestLuaCommentImports:
+    """A require inside a comment is not a dependency."""
+
+    def test_commented_out_require_is_not_an_import(self):
+        imports = _extract_imports('-- require("legacy_module")', "lua")
+        assert imports == []
+
+    def test_commented_out_include_is_not_an_import(self):
+        imports = _extract_imports('  -- include("old/path.lua")', "lua")
+        assert imports == []
+
+    def test_block_commented_require_is_not_an_import(self):
+        """`--[[ ... ]]` is how a chunk of Lua is disabled; only line 1 has `--`."""
+        content = '--[[\nrequire("legacy_module")\n]]\nrequire("live_module")'
+        modules = [i["module"] for i in _extract_imports(content, "lua")]
+        assert "legacy_module" not in modules
+        assert "live_module" in modules
+
+    def test_lua_include_module_keeps_the_path_without_the_extension(self):
+        """The edge builder reduces a module by splitting on `.` before `/`,
+        so one that kept its extension would reduce to "lua" and name no file.
+        """
+        content = 'include("lib/validate.lua")'
+        module = _extract_imports(content, "lua")[0]["module"]
+
+        assert module == "lib/validate"
+
+    def test_trailing_comment_require_is_not_an_import(self):
+        """A comment need not start the line to be a comment."""
+        imports = _extract_imports('local x = 1  -- require("legacy_module")', "lua")
+        assert imports == []
+
+    def test_unterminated_block_comment_is_not_a_source_of_imports(self):
+        """Callers pass a truncated head, which cuts the closing `]]` off."""
+        content = '--[[ disabled for now\nrequire("legacy_module")\ninclude("old.lua")'
+        assert _extract_imports(content, "lua") == []
+
+    def test_lua_require_also_drops_the_lua_extension(self):
+        """Whatever `include` does with a path, `require` must do too."""
+        modules = [i["module"] for i in _extract_imports('require("lib/validate.lua")', "lua")]
+        assert modules == ["lib/validate"]
+
+    def test_lua_include_rejects_mismatched_quotes(self):
+        imports = _extract_imports('include(\'mixed.lua")', "lua")
+        assert imports == []
+
+    def test_lua_include_of_a_quoted_path_survives_an_apostrophe(self):
+        modules = [i["module"] for i in _extract_imports('include("it\'s.lua")', "lua")]
+        assert modules == ["it's"]
+
+    def test_a_method_named_require_is_not_an_import(self):
+        """`self.require(...)` belongs to some table, not to the loader."""
+        assert _extract_imports('local m = self.require("notmine")', "lua") == []
+
+
+class TestFindPatternTruncation:
+    """find_pattern must say when its list is incomplete."""
+
+    def _configure(self, db, tmp_path, monkeypatch):
+        from srclight import server as server_mod
+        monkeypatch.setattr(server_mod, "_workspace_name", None)
+        monkeypatch.setattr(server_mod, "_db", db)
+        monkeypatch.setattr(server_mod, "_db_path", tmp_path / "test.db")
+        monkeypatch.setattr(server_mod, "_repo_root", tmp_path)
+        return server_mod
+
+    def test_more_matches_than_limit_reports_truncated(self, db, tmp_path, monkeypatch):
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(5):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=3))
+
+        assert result["match_count"] == 3
+        assert result["truncated"] is True
+
+    def test_exactly_limit_matches_is_not_truncated(self, db, tmp_path, monkeypatch):
+        """The off-by-one that makes the whole feature pointless if wrong."""
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(3):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=3))
+
+        assert result["match_count"] == 3
+        assert result["truncated"] is False
+
+    def test_fewer_matches_than_limit_is_not_truncated(self, db, tmp_path, monkeypatch):
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=50))
+
+        assert result["truncated"] is False
+
+    def test_matched_lines_total_counts_lines_not_symbols(self, db, tmp_path, monkeypatch):
+        """The count the root match_count's name implies but does not hold."""
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "two_hits", start_line=1, end_line=4,
+                       content="def two_hits():\n    # TODO: a\n    # TODO: b")
+        _insert_symbol(db, fid, "one_hit", start_line=10, end_line=12,
+                       content="def one_hit():\n    # TODO: c")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=50))
+
+        assert result["match_count"] == 2            # symbols
+        assert result["matched_lines_total"] == 3    # lines
+
+    def test_offset_is_echoed_and_pages(self, db, tmp_path, monkeypatch):
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(5):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        page = json.loads(server_mod.find_pattern("TODO", limit=3, offset=3))
+
+        assert page["offset"] == 3
+        assert page["match_count"] == 2
+        assert page["truncated"] is False
+
+    def test_scan_stops_once_limit_is_reached(self, db, tmp_path, monkeypatch):
+        """The row scan must stay bounded even when almost everything matches.
+
+        If a future change collected every matching symbol into a list
+        before slicing to `limit` (instead of breaking out of the database
+        cursor loop as soon as enough results are found), this would fail:
+        `scanned["n"]` would climb toward the full 500 inserted symbols
+        instead of staying near `limit`. That is the "nothing here ever
+        scans the whole index" promise in `find_pattern`'s docstring.
+        """
+        import json
+
+        from srclight import db as db_mod
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(500):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 3 + 1, end_line=i * 3 + 2,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        scanned = {"n": 0}
+        original = db_mod.Database._row_to_symbol
+
+        def counting(self, row):
+            scanned["n"] += 1
+            return original(self, row)
+
+        monkeypatch.setattr(db_mod.Database, "_row_to_symbol", counting)
+
+        result = json.loads(server_mod.find_pattern("TODO", limit=1))
+
+        assert result["match_count"] == 1
+        assert result["truncated"] is True
+        # Every one of the 500 symbols matches, so if the scan were
+        # unbounded this would be 500, not a handful.
+        assert scanned["n"] <= 5
+
+    def test_truncated_is_exact_when_offset_is_nonzero(self, db, tmp_path, monkeypatch):
+        """`truncated` must reflect what's left *after* `offset`, not just `limit`.
+
+        This is the seam between paging (`offset`) and truncation detection
+        (`limit + 1`): a page in the middle of a result set must report
+        `truncated: true` when more rows remain beyond it, and the final
+        page must report `truncated: false` even though `offset > 0`. Prior
+        coverage only exercised offset with a final, exactly-fitting page.
+        """
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        for i in range(5):
+            _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5 + 1, end_line=i * 5 + 3,
+                           content=f"def fn_{i}():\n    # TODO: item {i}")
+        db.commit()
+
+        middle_page = json.loads(server_mod.find_pattern("TODO", limit=2, offset=1))
+        assert middle_page["match_count"] == 2
+        assert middle_page["truncated"] is True  # 2 more (indices 3, 4) remain
+
+        final_page = json.loads(server_mod.find_pattern("TODO", limit=2, offset=3))
+        assert final_page["match_count"] == 2
+        assert final_page["truncated"] is False  # nothing left after this page
+
+    def test_existing_keys_are_untouched(self, db, tmp_path, monkeypatch):
+        """The additive-only constraint, asserted rather than assumed."""
+        import json
+        server_mod = self._configure(db, tmp_path, monkeypatch)
+        fid = _insert_file(db)
+        _insert_symbol(db, fid, "only", content="def only():\n    # TODO: x")
+        db.commit()
+
+        result = json.loads(server_mod.find_pattern("TODO"))
+
+        assert {"pattern", "match_count", "file_count", "by_file"} <= set(result)
+        assert result["by_file"]["src/main.py"][0]["name"] == "only"

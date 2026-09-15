@@ -193,16 +193,18 @@ The `project` parameter filters to one repo. Omit it to search all.
 2. The `post-commit` hook fires (background, non-blocking)
 3. `srclight index .` runs with `flock` (prevents concurrent re-indexes)
 4. Changed files are re-parsed (tree-sitter), FTS5 indexes updated
-5. Output logged to `.srclight/reindex.log`
+5. Embeddings are refreshed too, if this index has a recorded model (or `SRCLIGHT_EMBED_MODEL` reaches the hook and the index has recorded nothing)
+6. Output logged to `.srclight/reindex.log`
+7. Under Git for Windows (for example a WSL clone under `/mnt/c` committed from Windows) the hooks exit without doing anything, because the srclight binary they name is a Linux path
 
-**Note**: The hook does NOT re-embed. FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is always fresh. Semantic search for new/changed symbols requires a manual embed pass (see below).
+**Note**: step 5 is why `--embed` is passed only once. An index that has never embedded stays keyword-only, and `--forget-embed-model` takes an index back to that state. If the embedding provider is unreachable when the hook fires, the run logs a warning and keeps the parse work: FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is never held hostage to the embedding model.
 
 ### What Happens on Branch Switch
 
 1. `git checkout other-branch` triggers `post-checkout` hook
 2. Only fires on branch checkouts (not file checkouts) and only when HEAD changes
 3. Same background `srclight index .` as post-commit
-4. FTS5 indexes updated for all files that differ between branches
+4. FTS5 indexes updated for all files that differ between branches, and embeddings with them when a model resolves (see post-commit, step 5)
 
 ### Re-Embedding After Significant Changes
 
@@ -222,14 +224,16 @@ srclight workspace index -w myworkspace -p project-name --embed qwen3-embedding
 
 Embedding is incremental — only symbols whose `body_hash` changed get re-embedded. The `.npy` sidecar is rebuilt automatically after embedding.
 
+`--embed` is only needed the first time: the index records the model and reuses it on every later run, so a bare `srclight index` re-embeds too. `SRCLIGHT_EMBED_MODEL` picks a model for indexes that have none recorded — it is a default, not an override, so it never silently switches a repo that already embeds. `--no-embed` skips embedding for a single run; `--forget-embed-model` stops this index from embedding until `--embed` is passed again.
+
 ### Automating Embedding Refresh with Cron
 
-Git hooks keep the FTS5 index fresh on every commit, but they do **not** re-embed — embedding requires calling the embedding model (e.g. Ollama) and would slow down every commit. For teams that rely on `hybrid_search` or `semantic_search`, a nightly cron job keeps embeddings current without manual intervention.
+Git hooks reindex in the background with a bare `srclight index .`, so they re-embed whenever a model resolves — the one recorded in the index, or `SRCLIGHT_EMBED_MODEL` if the hook's environment carries it and the index has recorded nothing. `srclight index --forget-embed-model` records a deliberate "off" that outranks the variable. That covers day-to-day drift. A nightly cron job is still useful to catch repos whose embedding provider was down at commit time, and to install hooks in newly added repos.
 
 ```bash
 # Add to crontab (crontab -e)
 # Nightly at 2:13am — reindex + embed all projects, then install hooks for any new repos
-13 2 * * * /path/to/srclight-venv/bin/srclight workspace index -w myworkspace --embed qwen3-embedding >> /tmp/srclight-embed-cron.log 2>&1 && /path/to/srclight-venv/bin/srclight hook install --workspace myworkspace >> /tmp/srclight-embed-cron.log 2>&1
+13 2 * * * date -Is >> ~/.local/state/srclight/cron.log; /path/to/srclight-venv/bin/srclight workspace index -w myworkspace --embed qwen3-embedding >> ~/.local/state/srclight/cron.log 2>&1; /path/to/srclight-venv/bin/srclight hook install --workspace myworkspace >> ~/.local/state/srclight/cron.log 2>&1; /path/to/srclight-venv/bin/srclight hook status --workspace myworkspace >> ~/.local/state/srclight/cron.log 2>&1
 ```
 
 **Why this is fast most nights:** Both indexing and embedding are incremental. Files are skipped if their git hash hasn't changed; symbols are skipped if their `body_hash` hasn't changed. A workspace with 40 projects and 170K symbols typically finishes in under a minute on nights with little activity.
@@ -237,22 +241,52 @@ Git hooks keep the FTS5 index fresh on every commit, but they do **not** re-embe
 **Prerequisites:**
 - The embedding provider (e.g. Ollama) must be running at cron time
 - Use the full path to the `srclight` binary (cron doesn't load your shell profile)
-- The `hook install` step is idempotent — it adds hooks to new repos and skips existing ones
+- The `hook install` step is safe to repeat — it adds hooks to new repos, repairs hooks whose binary has gone, and leaves working hooks alone
 
 **Checking the log:**
 ```bash
-tail -50 /tmp/srclight-embed-cron.log
+tail -50 ~/.local/state/srclight/cron.log
 ```
+
+Keep the log out of `/tmp`, which a reboot clears, and separate the commands with `;` rather than `&&`, so a failed index run still reinstalls hooks and still records `hook status`. Create the directory once with `mkdir -p ~/.local/state/srclight`.
+
+`hook install` repairs a hook whose binary no longer exists (for example after moving the checkout), and leaves a working hook alone unless you pass `--force`. `hook status` reports `STALE` for a hook whose binary is missing and for a `core.hooksPath` that points at a missing directory.
+
+#### Rotating the cron log
+
+The log grows every night. A user-level logrotate run keeps it bounded without root:
+
+```ini
+# ~/.config/logrotate/srclight.conf
+/home/you/.local/state/srclight/cron.log {
+    weekly
+    maxsize 20M
+    rotate 8
+    compress
+    delaycompress
+    dateext
+    missingok
+    notifempty
+}
+```
+
+```bash
+mkdir -p ~/.local/state/logrotate
+# Before the 02:13 job, with a user-owned state file:
+5 2 * * * /usr/sbin/logrotate --state /home/you/.local/state/logrotate/srclight.state /home/you/.config/logrotate/srclight.conf
+```
+
+Check the configuration with `logrotate -d --state ... ~/.config/logrotate/srclight.conf`. The cron job opens the log afresh on each run, so no `copytruncate` is needed.
 
 ### How Incremental Indexing Works
 
 | Layer | What triggers it | What it does | Speed |
 |-------|-----------------|--------------|-------|
 | **FTS5 index** | Git hooks (`post-commit`, `post-checkout`) | Re-parses changed files via tree-sitter, updates symbol/edge tables and FTS5 indexes | 1-5s per commit |
-| **Embeddings** | Manual `--embed` or cron | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
+| **Embeddings** | Any index run once the model is known (hooks, cron, `--embed`) | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
 | **Vector cache** | Automatic after embedding | Rebuilds `.npy` sidecar files for GPU/CPU-resident search | <1s |
 
-The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag until the next `--embed` pass. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
+The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag whenever no model resolves for a run (`--no-embed`, `--forget-embed-model`, or an index that has never embedded) or the provider is unreachable at index time — that last case logs a warning and moves on, keeping the parse work. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
 
 ## Document Extraction
 

@@ -79,11 +79,20 @@ def main(verbose: bool):
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option("--db", "db_path", type=click.Path(), help="Database path (default: .srclight/index.db)")
 @click.option("--embed", "embed_model", type=str, default=None,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3)")
-def index(path: str, db_path: str | None, embed_model: str | None):
+              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). Passed once: "
+                   "later runs reuse the model recorded in the index, else "
+                   "$SRCLIGHT_EMBED_MODEL.")
+@click.option("--no-embed", is_flag=True, default=False,
+              help="Index without embeddings for this run. Changed files still lose "
+                   "the embeddings of the symbols they replace.")
+@click.option("--forget-embed-model", is_flag=True, default=False,
+              help="Stop embedding this index for good: later runs, git hooks included, "
+                   "leave embeddings alone until --embed is passed again.")
+def index(path: str, db_path: str | None, embed_model: str | None, no_embed: bool,
+          forget_embed_model: bool):
     """Index a codebase for AI-powered search."""
     from .db import Database
-    from .indexer import IndexConfig, Indexer
+    from .indexer import EMBED_MODEL_ENV, IndexConfig, Indexer, resolve_embed_model
 
     root = Path(path).resolve()
     if not root.is_dir():
@@ -101,14 +110,43 @@ def index(path: str, db_path: str | None, embed_model: str | None):
 
     click.echo(f"Indexing {root}")
     click.echo(f"Database: {db_file}")
-    if embed_model:
-        click.echo(f"Embedding model: {embed_model}")
 
     db = Database(db_file)
     db.open()
     db.initialize()
 
-    config = IndexConfig(root=root, embed_model=embed_model)
+    if forget_embed_model:
+        db.forget_embedding_model()
+        db.commit()
+        note = "Embedding model: forgotten — later runs will not embed"
+        if embed_model:
+            # --no-embed names the flag it overrode; this one must too, or
+            # the run reads as if --embed had been recorded and used.
+            note += f"; --embed {embed_model} ignored"
+        click.echo(note)
+
+    config = IndexConfig(
+        root=root, embed_model=embed_model,
+        disable_embeddings=no_embed or forget_embed_model,
+    )
+    # Resolve once and pin the result: resolving again inside the indexer, after
+    # the file pass, can disagree with what we printed here — a checkout that
+    # drops every embedded file cascade-deletes its embeddings mid-run.
+    resolved_model = resolve_embed_model(db, config)
+    config.embed_model = resolved_model
+    if no_embed:
+        if embed_model:
+            click.echo(f"Embeddings: skipped (--no-embed); --embed {embed_model} ignored")
+        else:
+            click.echo("Embeddings: skipped (--no-embed)")
+    elif resolved_model and embed_model:
+        click.echo(f"Embedding model: {resolved_model}")
+    elif resolved_model:
+        origin = ("from the existing index"
+                  if resolved_model == db.detect_embedding_model()
+                  else f"from ${EMBED_MODEL_ENV}")
+        click.echo(f"Embedding model: {resolved_model} ({origin})")
+
     indexer = Indexer(db, config)
 
     def on_progress(file: str, current: int, total: int):
@@ -130,8 +168,9 @@ def index(path: str, db_path: str | None, embed_model: str | None):
     db_stats = db.stats()
     click.echo(f"  Database size:   {db_stats['db_size_mb']} MB")
 
-    if embed_model:
+    if resolved_model:
         emb_stats = db.embedding_stats()
+        click.echo(f"  Embedded now:    {stats.symbols_embedded}")
         click.echo(f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
                     f" ({emb_stats['coverage_pct']}%)")
 
@@ -324,6 +363,120 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
     run_server(transport=transport, port=port)
 
 
+@main.command(
+    "tool",
+    add_help_option=False,          # so `tool <name> --help` reaches the tool
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.argument("tool_name", required=False)
+@click.option("--list", "list_tools_flag", is_flag=True, help="List every available tool")
+@click.option("--db", "db_path", type=click.Path(), help="Database path")
+@click.option("--workspace", "-w", "workspace_name", help="Workspace name (multi-repo mode)")
+@click.pass_context
+def tool(ctx: click.Context, tool_name: str | None, list_tools_flag: bool,
+         db_path: str | None, workspace_name: str | None):
+    """Run any MCP tool from the shell.
+
+    The tools, their arguments and their help text come from the running
+    server's own registry, so this command tracks the MCP surface exactly —
+    including across upgrades, which means a tool renamed there is renamed
+    here too.
+
+    Output is the tool's JSON on stdout and nothing else. Exit codes: 0 on
+    success, 1 when the tool reports an error, 2 on a usage error — and a
+    usage error, having no tool result to report, leaves stdout empty and
+    says why on stderr.
+    """
+    import asyncio
+
+    from .server import configure, configure_workspace, mcp
+    from .tool_dispatch import (
+        ToolArgumentError,
+        coerce_arguments,
+        format_tool_help,
+        parse_cli_pairs,
+    )
+
+    if tool_name in ("--help", "-h"):
+        click.echo(ctx.get_help())
+        ctx.exit(0)
+
+    tools = asyncio.run(mcp.list_tools())
+    by_name = {t.name: t for t in tools}
+
+    if list_tools_flag or not tool_name:
+        for name in sorted(by_name):
+            summary = (by_name[name].description or "").strip().split("\n")[0]
+            click.echo(f"{name}  {summary}")
+        return
+
+    spec = by_name.get(tool_name)
+    if spec is None:
+        close = [n for n in sorted(by_name) if n.startswith(tool_name[:4])]
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        click.echo(f"Error: unknown tool '{tool_name}'.{hint} "
+                   f"Run 'srclight tool --list' to see all tools.", err=True)
+        sys.exit(2)
+
+    if tool_name == "restart_server":
+        click.echo(
+            "Error: 'restart_server' only makes sense against a long-lived SSE "
+            "server process; a one-shot CLI invocation has nothing left to "
+            "restart into. Run it over MCP against a running 'srclight serve' "
+            "instead.", err=True,
+        )
+        sys.exit(2)
+
+    if "--help" in ctx.args or "-h" in ctx.args:
+        click.echo(format_tool_help(spec.name, spec.description or "", spec.input_schema))
+        return
+
+    try:
+        properties = spec.input_schema.get("properties", {})
+        arguments = coerce_arguments(
+            spec.input_schema, parse_cli_pairs(list(ctx.args), properties)
+        )
+    except ToolArgumentError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(2)
+
+    if workspace_name:
+        configure_workspace(workspace_name)
+    elif db_path:
+        db_file = Path(db_path).resolve()
+        configure(db_path=db_file, repo_root=_find_repo_root(db_file.parent))
+    else:
+        root = _find_repo_root(Path.cwd())
+        configure(db_path=_get_db_path(root), repo_root=root)
+
+    try:
+        result = asyncio.run(mcp.call_tool(spec.name, arguments))
+    except Exception as e:
+        # mcp.call_tool() raises rather than returning an isError result, so
+        # this is the only path most tool failures take (missing index, bad
+        # --db, unknown workspace, ...). Keep stdout as JSON here too, so a
+        # caller that reached the tool at all still parses one shape. A usage
+        # error is the other case and does not: it exits 2 with stdout empty
+        # and the reason on stderr, because there is no tool result to speak of.
+        click.echo(json.dumps({"error": f"{type(e).__name__}: {e}"}))
+        click.echo(f"Error: tool '{spec.name}' failed: {e}", err=True)
+        sys.exit(1)
+
+    text = "\n".join(
+        block.text for block in result.content if getattr(block, "text", None) is not None
+    )
+    click.echo(text)
+
+    if getattr(result, "isError", False):
+        sys.exit(1)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict) and "error" in parsed:
+        sys.exit(1)
+
+
 # --- Workspace commands ---
 
 
@@ -375,11 +528,20 @@ def workspace_remove(project_name: str, ws_name: str):
 @click.option("--workspace", "-w", "ws_name", required=True, help="Workspace to index")
 @click.option("--project", "-p", help="Index only this project (default: all)")
 @click.option("--embed", "embed_model", type=str, default=None,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3)")
-def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
+              help="Embedding model (e.g., qwen3-embedding, voyage-code-3). Passed once: "
+                   "later runs reuse the model recorded in each index, else "
+                   "$SRCLIGHT_EMBED_MODEL.")
+@click.option("--no-embed", is_flag=True, default=False,
+              help="Index without embeddings for this run. Changed files still lose "
+                   "the embeddings of the symbols they replace.")
+@click.option("--forget-embed-model", is_flag=True, default=False,
+              help="Stop embedding every index in the workspace for good: later runs, "
+                   "git hooks included, leave embeddings alone until --embed is passed again.")
+def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
+                    no_embed: bool, forget_embed_model: bool):
     """Index all (or one) project in a workspace."""
     from .db import Database
-    from .indexer import IndexConfig, Indexer
+    from .indexer import EMBED_MODEL_ENV, IndexConfig, Indexer, resolve_embed_model
     from .workspace import WorkspaceConfig
 
     config = WorkspaceConfig.load(ws_name)
@@ -391,7 +553,15 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
             click.echo(f"Project '{project}' not found in workspace '{ws_name}'", err=True)
             sys.exit(1)
 
-    if embed_model:
+    if no_embed or forget_embed_model:
+        # Forgetting disables embeddings for the run too, so announcing
+        # --embed here would name a model that goes nowhere.
+        why = "--no-embed" if no_embed else "--forget-embed-model"
+        if embed_model:
+            click.echo(f"Embeddings: skipped ({why}); --embed {embed_model} ignored")
+        else:
+            click.echo(f"Embeddings: skipped ({why})")
+    elif embed_model:
         click.echo(f"Embedding model: {embed_model}")
 
     for entry in entries:
@@ -410,7 +580,22 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
             db.open()
             db.initialize()
 
-            indexer_config = IndexConfig(root=root, embed_model=embed_model)
+            if forget_embed_model:
+                db.forget_embedding_model()
+                db.commit()
+                click.echo("    Embedding model: forgotten — later runs will not embed")
+
+            indexer_config = IndexConfig(
+                root=root, embed_model=embed_model,
+                disable_embeddings=no_embed or forget_embed_model,
+            )
+            resolved_model = resolve_embed_model(db, indexer_config)
+            indexer_config.embed_model = resolved_model  # pin it, see index()
+            if resolved_model and not embed_model:
+                origin = ("from the existing index"
+                          if resolved_model == db.detect_embedding_model()
+                          else f"from ${EMBED_MODEL_ENV}")
+                click.echo(f"    Embedding model: {resolved_model} ({origin})")
             indexer = Indexer(db, indexer_config)
 
             def on_progress(file: str, current: int, total: int):
@@ -546,6 +731,9 @@ def _post_commit_snippet(srclight_path: str) -> str:
     """Hook snippet for post-commit: reindex after every commit."""
     return f"""{_HOOK_MARKER_START}
 # Auto-reindex after commit (installed by srclight hook install)
+# Git for Windows also runs these hooks (e.g. WSL clones under /mnt/c), but
+# the srclight binary is a Linux path, so do nothing there.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exit 0 ;; esac
 if [ -x "{srclight_path}" ]; then
     (
         cd "$(git rev-parse --show-toplevel)" && \\
@@ -556,6 +744,10 @@ if [ -x "{srclight_path}" ]; then
     ) &
     disown 2>/dev/null
 fi
+# A missing binary (the checkout moved) must leave a trace, not exit silently.
+[ -x "{srclight_path}" ] || \\
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) srclight hook: {srclight_path} not executable; auto-reindex skipped (run: srclight hook install)" \\
+    2>/dev/null >> "$(git rev-parse --show-toplevel)/.srclight/reindex.log"
 exit 0
 {_HOOK_MARKER_END}"""
 
@@ -569,6 +761,9 @@ def _post_checkout_snippet(srclight_path: str) -> str:
     return f"""{_HOOK_MARKER_START}
 # Auto-reindex on branch switch (installed by srclight hook install)
 # $1=prev_HEAD $2=new_HEAD $3=1 if branch checkout
+# Git for Windows also runs these hooks (e.g. WSL clones under /mnt/c), but
+# the srclight binary is a Linux path, so do nothing there.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exit 0 ;; esac
 if [ "$3" = "1" ] && [ "$1" != "$2" ] && [ -x "{srclight_path}" ]; then
     (
         cd "$(git rev-parse --show-toplevel)" && \\
@@ -579,16 +774,76 @@ if [ "$3" = "1" ] && [ "$1" != "$2" ] && [ -x "{srclight_path}" ]; then
     ) &
     disown 2>/dev/null
 fi
+# A missing binary (the checkout moved) must leave a trace, not exit silently.
+[ -x "{srclight_path}" ] || \\
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) srclight hook: {srclight_path} not executable; auto-reindex skipped (run: srclight hook install)" \\
+    2>/dev/null >> "$(git rev-parse --show-toplevel)/.srclight/reindex.log"
 exit 0
 {_HOOK_MARKER_END}"""
 
 
-def _write_hook_file(hook_file: Path, snippet: str) -> bool:
-    """Write snippet into a hook file. Returns True if newly installed, False if already present."""
+def _hook_blocks(text: str) -> list:
+    """Every complete srclight block (START..END) in a hook file, as re.Match objects."""
+    import re as _re
+    pattern = _re.compile(
+        _re.escape(_HOOK_MARKER_START) + r".*?" + _re.escape(_HOOK_MARKER_END),
+        _re.DOTALL,
+    )
+    return list(pattern.finditer(text))
+
+
+def _hook_target(block: str) -> str | None:
+    """The binary a srclight block guards on with `[ -x "..." ]`, read from the block only."""
+    import re as _re
+    m = _re.search(r'\[ -x "([^"]+)" \]', block)
+    return m.group(1) if m else None
+
+
+def _is_executable(path: str | None) -> bool:
+    import os
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def _hooks_dir(repo_path: Path) -> Path:
+    """The directory git actually runs hooks from, honouring core.hooksPath.
+
+    Falls back to .git/hooks when git cannot answer (not a repo, git missing).
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--git-path", "hooks"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return repo_path / ".git" / "hooks"
+    if out.returncode != 0 or not out.stdout.strip():
+        return repo_path / ".git" / "hooks"
+    p = Path(out.stdout.strip())
+    return p if p.is_absolute() else repo_path / p
+
+
+def _write_hook_file(hook_file: Path, snippet: str, force: bool = False) -> bool:
+    """Write snippet into a hook file. Returns True if installed or updated, False if left alone.
+
+    An existing srclight block is replaced only when its binary no longer runs
+    (the checkout moved), or when force is set. A working block that names a
+    different binary is kept, so installs from different environments (venv,
+    uvx, the app's frozen engine) cannot keep re-pointing each other's hooks.
+    """
     if hook_file.exists():
         existing = hook_file.read_text()
         if _HOOK_MARKER_START in existing:
-            return False
+            blocks = _hook_blocks(existing)
+            if len(blocks) != 1 or blocks[0].group(0) == snippet:
+                # No end marker, or duplicates: hook status reports these.
+                return False
+            block = blocks[0]
+            if not force and _is_executable(_hook_target(block.group(0))):
+                return False
+            hook_file.write_text(existing[:block.start()] + snippet + existing[block.end():])
+            hook_file.chmod(0o755)
+            return True
         # Remove legacy (codelight) hook if present, then install new one
         if _LEGACY_MARKER_START in existing:
             import re as _re
@@ -661,14 +916,19 @@ def _ensure_gitignore(repo_path: Path) -> None:
         gitignore.write_text(f"{pattern}\n")
 
 
-def _install_hooks_in_repo(repo_path: Path, srclight_path: str) -> str:
+def _install_hooks_in_repo(repo_path: Path, srclight_path: str, force: bool = False) -> str:
     """Install post-commit + post-checkout hooks. Returns status message."""
     git_dir = repo_path / ".git"
     if not git_dir.is_dir():
         return f"  SKIP {repo_path.name}: not a git repo"
 
-    hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir(exist_ok=True)
+    hooks_dir = _hooks_dir(repo_path)
+    if hooks_dir == git_dir / "hooks":
+        hooks_dir.mkdir(exist_ok=True)
+    elif not hooks_dir.is_dir():
+        # A core.hooksPath left pointing at a moved directory: git runs no
+        # hooks at all, so writing .git/hooks would only look like a repair.
+        return f"  FAIL {repo_path.name}: core.hooksPath points at missing {hooks_dir}"
 
     snippets = {
         "post-commit": _post_commit_snippet(srclight_path),
@@ -678,7 +938,7 @@ def _install_hooks_in_repo(repo_path: Path, srclight_path: str) -> str:
     installed = []
     skipped = []
     for hook_name, snippet in snippets.items():
-        if _write_hook_file(hooks_dir / hook_name, snippet):
+        if _write_hook_file(hooks_dir / hook_name, snippet, force=force):
             installed.append(hook_name)
         else:
             skipped.append(hook_name)
@@ -696,7 +956,7 @@ def _install_hooks_in_repo(repo_path: Path, srclight_path: str) -> str:
 
 def _uninstall_hooks_in_repo(repo_path: Path) -> str:
     """Remove srclight hooks from a repo. Returns status message."""
-    hooks_dir = repo_path / ".git" / "hooks"
+    hooks_dir = _hooks_dir(repo_path)
     removed = []
     for hook_name in _HOOK_NAMES:
         if _remove_hook_snippet(hooks_dir / hook_name):
@@ -709,7 +969,9 @@ def _uninstall_hooks_in_repo(repo_path: Path) -> str:
 
 @hook.command("install")
 @click.option("--workspace", "-w", "ws_name", help="Install across all repos in a workspace")
-def hook_install(ws_name: str | None):
+@click.option("--force", is_flag=True,
+              help="Also rewrite srclight blocks whose binary still runs")
+def hook_install(ws_name: str | None, force: bool):
     """Install git hooks for auto-reindexing (post-commit + post-checkout).
 
     Installs two hooks:
@@ -717,12 +979,24 @@ def hook_install(ws_name: str | None):
     - post-checkout: reindex when switching branches
 
     Both run in the background and only re-parse changed files (incremental).
+    On an index that has a recorded embedding model they also refresh
+    embeddings, which calls that model — `srclight index --forget-embed-model`
+    turns that off for a repo.
 
     Without --workspace, installs in the current repo.
     With --workspace, installs across all repos in the workspace.
     """
     srclight_path = _srclight_bin()
     click.echo(f"Using srclight: {srclight_path}")
+    if not _is_executable(srclight_path):
+        # The hooks guard on `[ -x path ]`; a path that fails it (the
+        # `python -m` fallback, a missing file) installs hooks that never run.
+        click.echo(
+            f"Error: {srclight_path} is not an executable file, so hooks using it "
+            "would never run. Run this from the srclight venv's bin/srclight.",
+            err=True,
+        )
+        sys.exit(1)
 
     if ws_name:
         from .workspace import WorkspaceConfig
@@ -732,10 +1006,10 @@ def hook_install(ws_name: str | None):
             if not repo_path.exists():
                 click.echo(f"  SKIP {entry.name}: path not found ({entry.path})")
                 continue
-            click.echo(_install_hooks_in_repo(repo_path, srclight_path))
+            click.echo(_install_hooks_in_repo(repo_path, srclight_path, force=force))
     else:
         root = _find_repo_root(Path.cwd())
-        click.echo(_install_hooks_in_repo(root, srclight_path))
+        click.echo(_install_hooks_in_repo(root, srclight_path, force=force))
 
 
 @hook.command("uninstall")
@@ -909,12 +1183,33 @@ def hook_status(ws_name: str | None):
         if not repo_path.exists():
             click.echo(f"  {name:<20} path not found")
             continue
-        hooks_dir = repo_path / ".git" / "hooks"
+        hooks_dir = _hooks_dir(repo_path)
+        if not hooks_dir.is_dir() and hooks_dir != repo_path / ".git" / "hooks":
+            click.echo(f"  {name:<20} STALE: core.hooksPath points at missing {hooks_dir}")
+            continue
         statuses = []
         for hook_name in _HOOK_NAMES:
             hf = hooks_dir / hook_name
-            if hf.exists() and (_HOOK_MARKER_START in hf.read_text()
-                                or _LEGACY_MARKER_START in hf.read_text()):
+            if not hf.exists():
+                continue
+            text = hf.read_text()
+            if _HOOK_MARKER_START not in text:
+                if _LEGACY_MARKER_START in text:
+                    statuses.append(f"{hook_name} (legacy codelight block)")
+                continue
+            # The hook exits 0 whether or not its binary exists, so a marker
+            # alone does not mean auto-reindex runs.
+            blocks = _hook_blocks(text)
+            if not blocks:
+                statuses.append(f"{hook_name} (BROKEN: no end marker)")
+                continue
+            if len(blocks) > 1:
+                statuses.append(f"{hook_name} (BROKEN: {len(blocks)} srclight blocks)")
+                continue
+            target = _hook_target(blocks[0].group(0))
+            if not _is_executable(target):
+                statuses.append(f"{hook_name} (STALE: {target} not executable)")
+            else:
                 statuses.append(hook_name)
         if statuses:
             click.echo(f"  {name:<20} {', '.join(statuses)}")

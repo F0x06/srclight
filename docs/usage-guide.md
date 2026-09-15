@@ -195,7 +195,10 @@ The `project` parameter filters to one repo. Omit it to search all.
 4. Changed files are re-parsed (tree-sitter), FTS5 indexes updated
 5. Embeddings are refreshed too, if this index has a recorded model (or `SRCLIGHT_EMBED_MODEL` reaches the hook and the index has recorded nothing)
 6. Output logged to `.srclight/reindex.log`
-7. Under Git for Windows (for example a WSL clone under `/mnt/c` committed from Windows) the hooks exit without doing anything, because the srclight binary they name is a Linux path
+7. Under Git for Windows (for example a WSL clone under `/mnt/c` committed from Windows) the hooks do nothing, because the srclight binary they name is a Linux path
+8. If that binary is missing (for example after the checkout moved), the hook prints a warning on stderr and records it in `.srclight/reindex.log`, and the commit still succeeds
+
+The srclight block ends without `exit`, so lines another tool adds to the same hook after it still run. To keep hooks out of one repo for good, even when a nightly `hook install --workspace` runs, use `git config srclight.hooks false` in that repo.
 
 **Note**: step 5 is why `--embed` is passed only once. An index that has never embedded stays keyword-only, and `--forget-embed-model` takes an index back to that state. If the embedding provider is unreachable when the hook fires, the run logs a warning and keeps the parse work: FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is never held hostage to the embedding model.
 
@@ -241,7 +244,8 @@ Git hooks reindex in the background with a bare `srclight index .`, so they re-e
 **Prerequisites:**
 - The embedding provider (e.g. Ollama) must be running at cron time
 - Use the full path to the `srclight` binary (cron doesn't load your shell profile)
-- The `hook install` step is safe to repeat — it adds hooks to new repos, repairs hooks whose binary has gone, and leaves working hooks alone
+- The `hook install` step is safe to repeat — it adds hooks to new repos, repairs hooks whose binary has gone, upgrades hooks from an older srclight to the current snippet while keeping the binary they use, and restores a hook file's execute bit. It skips repos with `srclight.hooks=false`
+- `hook install` and `hook status` exit 1 when a repo needs attention, and the server's `/healthz` (and the dashboard's health indicator) lists workspace repos whose hooks will not run
 
 **Checking the log:**
 ```bash
@@ -250,7 +254,7 @@ tail -50 ~/.local/state/srclight/cron.log
 
 Keep the log out of `/tmp`, which a reboot clears, and separate the commands with `;` rather than `&&`, so a failed index run still reinstalls hooks and still records `hook status`. Create the directory once with `mkdir -p ~/.local/state/srclight`.
 
-`hook install` repairs a hook whose binary no longer exists (for example after moving the checkout), and leaves a working hook alone unless you pass `--force`. `hook status` reports `STALE` for a hook whose binary is missing and for a `core.hooksPath` that points at a missing directory.
+`hook install` repairs a hook whose binary no longer exists (for example after moving the checkout) and upgrades an outdated one in place; `--force` also re-points working hooks at the binary you run it with. It refuses a `core.hooksPath` inside the work tree that git does not ignore, because the hooks name a local path and would be committed. `hook status` reports `MISSING`, `BROKEN`, `STALE` (binary missing, or a `core.hooksPath` at a missing directory), `NOT EXECUTABLE` (git skips the hook) and `OUTDATED`, and exits 1 on any of them.
 
 #### Rotating the cron log
 
@@ -426,7 +430,7 @@ srclight workspace status -w myworkspace
 
 The new repo is immediately searchable. The MCP server picks up new projects on the next tool call (no restart needed — workspace config is re-read).
 
-**Note:** Both `srclight index` and `srclight hook install` automatically add `.srclight/` to the repo's `.gitignore`. The index databases and embedding files can be large (hundreds of MB) and should never be committed.
+**Note:** Both `srclight index` and `srclight hook install` keep `.srclight/` out of git by adding it to the repo's `.git/info/exclude`, which is local and never committed, unless git already ignores it. They never edit your tracked `.gitignore`. The index databases and embedding files can be large (hundreds of MB) and should never be committed.
 
 ## Git Submodules
 

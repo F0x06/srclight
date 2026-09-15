@@ -11,6 +11,9 @@ from srclight.cli import (
     _HOOK_MARKER_START,
     _install_hooks_in_repo,
     _uninstall_hooks_in_repo,
+    _ensure_srclight_ignored,
+    _repo_hook_health,
+    hook_install,
     hook_status,
 )
 
@@ -131,12 +134,17 @@ def test_post_checkout_only_on_branch_switch(fake_repo):
     assert '"$1" != "$2"' in content
 
 
-def test_hooks_exit_zero(fake_repo):
-    """Hooks must exit 0 to avoid breaking git-flow and other tools."""
-    _install_hooks_in_repo(fake_repo, "/usr/bin/srclight")
-    for name in ("post-commit", "post-checkout"):
-        content = (fake_repo / ".git" / "hooks" / name).read_text()
-        assert "exit 0" in content, f"{name} hook missing 'exit 0'"
+def test_hooks_exit_zero(tmp_path, tmp_path_factory):
+    """Hooks must exit 0 (git takes post-checkout's status as its own), binary present or not."""
+    import subprocess
+    for bin_path in (_exe(tmp_path_factory), STALE_BIN):
+        repo = _git_repo(tmp_path / f"repo-{abs(hash(bin_path))}")
+        _install_hooks_in_repo(repo, bin_path)
+        for name, args in (("post-commit", []), ("post-checkout", ["a", "b", "1"]), ("post-checkout", ["a", "a", "0"])):
+            for shell in ("sh", "bash"):
+                r = subprocess.run([shell, str(repo / ".git" / "hooks" / name), *args],
+                                   cwd=repo, capture_output=True, text=True)
+                assert r.returncode == 0, (bin_path, name, args, shell, r.stderr)
 
 
 def test_hooks_use_flock(fake_repo):
@@ -339,3 +347,183 @@ def test_hook_still_runs_on_linux(tmp_path, tmp_path_factory):
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert marker.exists()
+
+
+
+# --- post-ship review (council 9286392f) ---------------------------------------------
+
+
+def test_content_after_block_still_runs(tmp_path, tmp_path_factory):
+    """No `exit` in the block: another tool's lines appended after it must run."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    pc = repo / ".git" / "hooks" / "post-commit"
+    pc.write_text(pc.read_text() + "\necho AFTER-BLOCK\n")
+    r = subprocess.run(["sh", str(pc)], cwd=repo, capture_output=True, text=True)
+    assert "AFTER-BLOCK" in r.stdout
+
+
+def test_missing_binary_trace_without_srclight_dir(tmp_path):
+    """A fresh clone or a worktree has no .srclight/: the trace must still land, and reach stderr."""
+    import shutil
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    _install_hooks_in_repo(repo, STALE_BIN)
+    shutil.rmtree(repo / ".srclight")
+    r = subprocess.run(["sh", str(repo / ".git" / "hooks" / "post-commit")],
+                       cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0
+    assert STALE_BIN in (repo / ".srclight" / "reindex.log").read_text()
+    assert "not executable" in r.stderr
+
+
+def test_post_checkout_trace_only_on_branch_switch(tmp_path):
+    import shutil
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    _install_hooks_in_repo(repo, STALE_BIN)
+    shutil.rmtree(repo / ".srclight")
+    r = subprocess.run(["sh", str(repo / ".git" / "hooks" / "post-checkout"), "a", "b", "0"],
+                       cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0 and r.stderr == ""
+    assert not (repo / ".srclight").exists()
+
+
+def test_status_and_install_handle_non_executable_hook_file(fake_repo, monkeypatch, tmp_path_factory):
+    """git skips a hook without +x; status must say so and install must restore it."""
+    from click.testing import CliRunner
+    bin_path = _exe(tmp_path_factory)
+    _install_hooks_in_repo(fake_repo, bin_path)
+    pc = fake_repo / ".git" / "hooks" / "post-commit"
+    pc.chmod(0o644)
+    healthy, summary = _repo_hook_health(fake_repo)
+    assert not healthy and "NOT EXECUTABLE" in summary
+    monkeypatch.chdir(fake_repo)
+    assert CliRunner().invoke(hook_status, []).exit_code == 1
+    result = _install_hooks_in_repo(fake_repo, bin_path)
+    assert "OK" in result and "post-commit" in result
+    assert os.access(pc, os.X_OK)
+    assert _repo_hook_health(fake_repo)[0]
+
+
+def test_outdated_block_upgraded_in_place_keeping_its_binary(fake_repo, tmp_path_factory):
+    """A working hook from an older snippet is upgraded without --force, and keeps its binary."""
+    first = _exe(tmp_path_factory)
+    other = _exe(tmp_path_factory)
+    _install_hooks_in_repo(fake_repo, first)
+    pc = fake_repo / ".git" / "hooks" / "post-commit"
+    pc.write_text(pc.read_text().replace("# Auto-reindex after commit", "# an older snippet's comment"))
+    healthy, summary = _repo_hook_health(fake_repo)
+    assert not healthy and "OUTDATED" in summary
+    result = _install_hooks_in_repo(fake_repo, other)
+    assert "OK" in result
+    content = pc.read_text()
+    assert first in content and other not in content
+    assert "an older snippet" not in content
+    assert _repo_hook_health(fake_repo)[0]
+
+
+def test_status_exit_code_tracks_health(fake_repo, monkeypatch, tmp_path_factory):
+    from click.testing import CliRunner
+    monkeypatch.chdir(fake_repo)
+    _install_hooks_in_repo(fake_repo, _exe(tmp_path_factory))
+    assert CliRunner().invoke(hook_status, []).exit_code == 0
+    (fake_repo / ".git" / "hooks" / "post-checkout").unlink()
+    res = CliRunner().invoke(hook_status, [])
+    assert res.exit_code == 1 and "MISSING" in res.output
+
+
+def test_cli_install_exits_1_when_a_repo_fails(tmp_path, monkeypatch, tmp_path_factory):
+    import subprocess
+    from click.testing import CliRunner
+    from srclight import cli
+    repo = _git_repo(tmp_path / "repo")
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "/nonexistent/hooks"], check=True)
+    bin_path = _exe(tmp_path_factory)
+    monkeypatch.setattr(cli, "_srclight_bin", lambda: bin_path)
+    monkeypatch.chdir(repo)
+    res = CliRunner().invoke(hook_install, [])
+    assert res.exit_code == 1 and "FAIL" in res.output
+
+
+def test_install_refuses_committable_hookspath(tmp_path, tmp_path_factory):
+    """core.hooksPath=.husky would commit hooks naming a local binary path."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".husky").mkdir()
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", ".husky"], check=True)
+    result = _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    assert "FAIL" in result and "would be committed" in result
+    assert not (repo / ".husky" / "post-commit").exists()
+
+
+def test_install_allows_ignored_hookspath_in_work_tree(tmp_path, tmp_path_factory):
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".hooks").mkdir()
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text(".hooks/\n")
+    subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", ".hooks"], check=True)
+    result = _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    assert "OK" in result
+    assert (repo / ".hooks" / "post-commit").exists()
+
+
+def test_opt_out_is_respected_by_install_and_status(tmp_path, tmp_path_factory):
+    """`git config srclight.hooks false` survives the nightly install."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    subprocess.run(["git", "-C", str(repo), "config", "srclight.hooks", "false"], check=True)
+    result = _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    assert "SKIP" in result and "disabled" in result
+    assert not (repo / ".git" / "hooks" / "post-commit").exists()
+    healthy, summary = _repo_hook_health(repo)
+    assert healthy and "disabled" in summary
+
+
+def test_install_ignores_srclight_via_info_exclude_not_gitignore(tmp_path, tmp_path_factory):
+    """Tracked files are never edited: third-party clones stayed dirty, CRLF files were rewritten."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_bytes(b"build/\r\n")
+    _install_hooks_in_repo(repo, _exe(tmp_path_factory))
+    assert (repo / ".gitignore").read_bytes() == b"build/\r\n"
+    assert ".srclight/" in (repo / ".git" / "info" / "exclude").read_text()
+    (repo / ".srclight" / "index.db").write_text("x")
+    st = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True).stdout
+    assert ".srclight" not in st
+
+
+def test_ensure_ignored_leaves_exclude_alone_when_already_ignored(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text(".srclight/\n")
+    _ensure_srclight_ignored(repo)
+    exclude = repo / ".git" / "info" / "exclude"
+    assert not exclude.exists() or ".srclight/" not in exclude.read_text()
+
+
+def test_ensure_ignored_is_idempotent(tmp_path):
+    repo = _git_repo(tmp_path / "repo")
+    _ensure_srclight_ignored(repo)
+    _ensure_srclight_ignored(repo)
+    lines = (repo / ".git" / "info" / "exclude").read_text().splitlines()
+    assert lines.count(".srclight/") == 1
+
+
+def test_healthz_hook_problems_lists_unhealthy_repos(tmp_path, monkeypatch, tmp_path_factory):
+    from types import SimpleNamespace
+
+    from srclight import web
+    from srclight import workspace as ws_mod
+    good = _git_repo(tmp_path / "good")
+    bad = _git_repo(tmp_path / "bad")
+    _install_hooks_in_repo(good, _exe(tmp_path_factory))
+    _install_hooks_in_repo(bad, STALE_BIN)
+    entries = [SimpleNamespace(name="good", path=str(good)), SimpleNamespace(name="bad", path=str(bad))]
+    monkeypatch.setattr(ws_mod.WorkspaceConfig, "load",
+                        classmethod(lambda cls, name: SimpleNamespace(get_entries=lambda: entries)))
+    monkeypatch.setattr(web, "_hook_health_cache", None)
+    problems = web._hook_health_problems("ws")
+    assert len(problems) == 1 and problems[0].startswith("bad:") and "STALE" in problems[0]
+    assert web._hook_health_problems(None) == []

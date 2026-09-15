@@ -104,9 +104,9 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
     # Ensure .srclight/ directory exists
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure .srclight/ is in .gitignore
+    # Keep .srclight/ out of git (in .git/info/exclude, never a tracked file)
     if (root / ".git").is_dir():
-        _ensure_gitignore(root)
+        _ensure_srclight_ignored(root)
 
     click.echo(f"Indexing {root}")
     click.echo(f"Database: {db_file}")
@@ -727,28 +727,52 @@ def _srclight_bin() -> str:
     return f"{sys.executable} -m srclight.cli"
 
 
+def _missing_bin_trace(srclight_path: str, indent: str) -> str:
+    """Shell lines that record a missing binary, for the hook snippets.
+
+    The log directory is created first (a fresh clone or a worktree has no
+    .srclight/), and the same line goes to stderr, so a person committing sees
+    it even when the log cannot be written.
+    """
+    msg = (f"srclight hook: {srclight_path} not executable; "
+           "auto-reindex skipped (run: srclight hook install)")
+    return (
+        f'{indent}mkdir -p "$_srclight_top/.srclight" 2>/dev/null\n'
+        f'{indent}echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) {msg}" 2>/dev/null >> "$_srclight_top/.srclight/reindex.log"\n'
+        f'{indent}echo "{msg}" >&2'
+    )
+
+
 def _post_commit_snippet(srclight_path: str) -> str:
-    """Hook snippet for post-commit: reindex after every commit."""
+    """Hook snippet for post-commit: reindex after every commit.
+
+    One conditional with no `exit`, so hook lines after the block still run,
+    closed by `:` so the block leaves the hook's status at 0.
+    """
+    trace = _missing_bin_trace(srclight_path, " " * 12)
     return f"""{_HOOK_MARKER_START}
 # Auto-reindex after commit (installed by srclight hook install)
 # Git for Windows also runs these hooks (e.g. WSL clones under /mnt/c), but
 # the srclight binary is a Linux path, so do nothing there.
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exit 0 ;; esac
-if [ -x "{srclight_path}" ]; then
-    (
-        cd "$(git rev-parse --show-toplevel)" && \\
-        mkdir -p .srclight && \\
-        flock -n .srclight/reindex.lock \\
-            "{srclight_path}" index . \\
-            >> .srclight/reindex.log 2>&1
-    ) &
-    disown 2>/dev/null
-fi
-# A missing binary (the checkout moved) must leave a trace, not exit silently.
-[ -x "{srclight_path}" ] || \\
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) srclight hook: {srclight_path} not executable; auto-reindex skipped (run: srclight hook install)" \\
-    2>/dev/null >> "$(git rev-parse --show-toplevel)/.srclight/reindex.log"
-exit 0
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *)
+        _srclight_top="$(git rev-parse --show-toplevel 2>/dev/null)"
+        if [ -x "{srclight_path}" ]; then
+            (
+                cd "$_srclight_top" && \\
+                mkdir -p .srclight && \\
+                flock -n .srclight/reindex.lock \\
+                    "{srclight_path}" index . \\
+                    >> .srclight/reindex.log 2>&1
+            ) &
+            disown 2>/dev/null
+        elif [ -n "$_srclight_top" ]; then
+{trace}
+        fi
+        ;;
+esac
+:
 {_HOOK_MARKER_END}"""
 
 
@@ -756,30 +780,43 @@ def _post_checkout_snippet(srclight_path: str) -> str:
     """Hook snippet for post-checkout: reindex on branch switch.
 
     post-checkout receives: $1=prev_HEAD $2=new_HEAD $3=is_branch_checkout
-    Only reindex when $3=1 (branch checkout, not file checkout) and HEAD changed.
+    Only acts when $3=1 (branch checkout, not file checkout) and HEAD changed.
+    git takes post-checkout's exit status as its own, so the block must end at 0.
     """
+    trace = _missing_bin_trace(srclight_path, " " * 16)
     return f"""{_HOOK_MARKER_START}
 # Auto-reindex on branch switch (installed by srclight hook install)
 # $1=prev_HEAD $2=new_HEAD $3=1 if branch checkout
 # Git for Windows also runs these hooks (e.g. WSL clones under /mnt/c), but
 # the srclight binary is a Linux path, so do nothing there.
-case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exit 0 ;; esac
-if [ "$3" = "1" ] && [ "$1" != "$2" ] && [ -x "{srclight_path}" ]; then
-    (
-        cd "$(git rev-parse --show-toplevel)" && \\
-        mkdir -p .srclight && \\
-        flock -n .srclight/reindex.lock \\
-            "{srclight_path}" index . \\
-            >> .srclight/reindex.log 2>&1
-    ) &
-    disown 2>/dev/null
-fi
-# A missing binary (the checkout moved) must leave a trace, not exit silently.
-[ -x "{srclight_path}" ] || \\
-    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) srclight hook: {srclight_path} not executable; auto-reindex skipped (run: srclight hook install)" \\
-    2>/dev/null >> "$(git rev-parse --show-toplevel)/.srclight/reindex.log"
-exit 0
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ;;
+    *)
+        if [ "$3" = "1" ] && [ "$1" != "$2" ]; then
+            _srclight_top="$(git rev-parse --show-toplevel 2>/dev/null)"
+            if [ -x "{srclight_path}" ]; then
+                (
+                    cd "$_srclight_top" && \\
+                    mkdir -p .srclight && \\
+                    flock -n .srclight/reindex.lock \\
+                        "{srclight_path}" index . \\
+                        >> .srclight/reindex.log 2>&1
+                ) &
+                disown 2>/dev/null
+            elif [ -n "$_srclight_top" ]; then
+{trace}
+            fi
+        fi
+        ;;
+esac
+:
 {_HOOK_MARKER_END}"""
+
+
+_HOOK_SNIPPETS = {
+    "post-commit": _post_commit_snippet,
+    "post-checkout": _post_checkout_snippet,
+}
 
 
 def _hook_blocks(text: str) -> list:
@@ -804,46 +841,91 @@ def _is_executable(path: str | None) -> bool:
     return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
 
 
-def _hooks_dir(repo_path: Path) -> Path:
-    """The directory git actually runs hooks from, honouring core.hooksPath.
-
-    Falls back to .git/hooks when git cannot answer (not a repo, git missing).
-    """
+def _git(repo_path: Path, *args: str):
+    """Run git in repo_path; None when git cannot be run at all."""
     import subprocess
     try:
-        out = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-parse", "--git-path", "hooks"],
+        return subprocess.run(
+            ["git", "-C", str(repo_path), *args],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return repo_path / ".git" / "hooks"
-    if out.returncode != 0 or not out.stdout.strip():
-        return repo_path / ".git" / "hooks"
+        return None
+
+
+def _git_path(repo_path: Path, name: str) -> Path:
+    """`git rev-parse --git-path name`, falling back to .git/<name> outside a real repo."""
+    out = _git(repo_path, "rev-parse", "--git-path", name)
+    if out is None or out.returncode != 0 or not out.stdout.strip():
+        return repo_path / ".git" / name
     p = Path(out.stdout.strip())
     return p if p.is_absolute() else repo_path / p
 
 
-def _write_hook_file(hook_file: Path, snippet: str, force: bool = False) -> bool:
-    """Write snippet into a hook file. Returns True if installed or updated, False if left alone.
+def _hooks_dir(repo_path: Path) -> Path:
+    """The directory git actually runs hooks from, honouring core.hooksPath."""
+    return _git_path(repo_path, "hooks")
 
-    An existing srclight block is replaced only when its binary no longer runs
-    (the checkout moved), or when force is set. A working block that names a
-    different binary is kept, so installs from different environments (venv,
-    uvx, the app's frozen engine) cannot keep re-pointing each other's hooks.
+
+def _hooks_disabled(repo_path: Path) -> bool:
+    """True when the repo opted out with `git config srclight.hooks false`."""
+    out = _git(repo_path, "config", "--bool", "--get", "srclight.hooks")
+    return out is not None and out.returncode == 0 and out.stdout.strip() == "false"
+
+
+def _committable_hooks_dir(repo_path: Path, hooks_dir: Path) -> str | None:
+    """Why srclight must not write into hooks_dir, or None when it may.
+
+    The hooks name an absolute local binary path. Written into a directory the
+    repository tracks (core.hooksPath=.husky, say) they would be committed.
     """
+    try:
+        rel = hooks_dir.resolve().relative_to(repo_path.resolve())
+    except ValueError:
+        return None  # outside the work tree
+    if rel.parts and rel.parts[0] == ".git":
+        return None
+    out = _git(repo_path, "check-ignore", "-q", (rel / "post-commit").as_posix())
+    if out is not None and out.returncode == 0:
+        return None
+    return (f"core.hooksPath {hooks_dir} is inside the work tree and not ignored; "
+            "srclight's hooks name a local binary path and would be committed")
+
+
+def _write_hook_file(hook_file: Path, make_snippet, srclight_path: str,
+                     force: bool = False) -> bool:
+    """Install or update srclight's block in a hook file. True if the file changed.
+
+    - A block whose binary no longer runs is rewritten for srclight_path.
+    - A block whose binary runs keeps that binary, but its text is upgraded to
+      the current snippet (the OUTDATED case), so snippet changes reach working
+      hooks without --force and installs from different environments cannot
+      re-point each other's hooks. --force rewrites for srclight_path.
+    - A hook file that lost its execute bit gets it back: git skips such hooks.
+    """
+    import os
     if hook_file.exists():
         existing = hook_file.read_text()
         if _HOOK_MARKER_START in existing:
             blocks = _hook_blocks(existing)
-            if len(blocks) != 1 or blocks[0].group(0) == snippet:
-                # No end marker, or duplicates: hook status reports these.
+            if len(blocks) != 1:
+                # No end marker, or duplicates: hook status reports these as
+                # BROKEN; guessing at a repair could eat the user's own lines.
                 return False
             block = blocks[0]
-            if not force and _is_executable(_hook_target(block.group(0))):
-                return False
-            hook_file.write_text(existing[:block.start()] + snippet + existing[block.end():])
-            hook_file.chmod(0o755)
-            return True
+            current = _hook_target(block.group(0))
+            if force or not _is_executable(current):
+                wanted = make_snippet(srclight_path)
+            else:
+                wanted = make_snippet(current)
+            changed = False
+            if block.group(0) != wanted:
+                hook_file.write_text(existing[:block.start()] + wanted + existing[block.end():])
+                changed = True
+            if not os.access(hook_file, os.X_OK):
+                hook_file.chmod(hook_file.stat().st_mode | 0o111)
+                changed = True
+            return changed
         # Remove legacy (codelight) hook if present, then install new one
         if _LEGACY_MARKER_START in existing:
             import re as _re
@@ -854,9 +936,9 @@ def _write_hook_file(hook_file: Path, snippet: str, force: bool = False) -> bool
             existing = pattern.sub("", existing).strip()
             if existing == "#!/bin/sh" or not existing:
                 existing = "#!/bin/sh"
-        hook_file.write_text(existing.rstrip() + "\n\n" + snippet + "\n")
+        hook_file.write_text(existing.rstrip() + "\n\n" + make_snippet(srclight_path) + "\n")
     else:
-        hook_file.write_text("#!/bin/sh\n\n" + snippet + "\n")
+        hook_file.write_text("#!/bin/sh\n\n" + make_snippet(srclight_path) + "\n")
     hook_file.chmod(0o755)
     return True
 
@@ -899,21 +981,79 @@ def _remove_hook_snippet(hook_file: Path) -> bool:
     return True
 
 
-def _ensure_gitignore(repo_path: Path) -> None:
-    """Ensure .srclight/ is listed in the repo's .gitignore."""
-    gitignore = repo_path / ".gitignore"
-    pattern = ".srclight/"
-    if gitignore.exists():
-        content = gitignore.read_text()
-        if pattern in content:
-            return
-        # Append with a newline guard
-        if content and not content.endswith("\n"):
-            content += "\n"
-        content += f"{pattern}\n"
-        gitignore.write_text(content)
-    else:
-        gitignore.write_text(f"{pattern}\n")
+def _ensure_srclight_ignored(repo_path: Path) -> None:
+    """Keep .srclight/ out of git without editing a tracked file.
+
+    Appends to .git/info/exclude, which is local and never committed, unless
+    git already ignores .srclight/ (a committed .gitignore, say). Writing the
+    tracked .gitignore dirtied third-party clones and rewrote CRLF files on
+    every hook run.
+    """
+    out = _git(repo_path, "check-ignore", "-q", ".srclight/index.db")
+    if out is not None and out.returncode == 0:
+        return
+    exclude = _git_path(repo_path, "info/exclude")
+    content = exclude.read_bytes() if exclude.exists() else b""
+    if b".srclight/" in (line.strip() for line in content.splitlines()):
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("ab") as f:
+        if content and not content.endswith(b"\n"):
+            f.write(b"\n")
+        f.write(b".srclight/\n")
+
+
+def _repo_hook_health(repo_path: Path) -> tuple[bool, str]:
+    """(healthy, summary) for srclight's auto-reindex hooks in one repo.
+
+    Unhealthy means auto-reindex does not run as installed: a hook missing,
+    BROKEN, STALE (binary gone), NOT EXECUTABLE (git skips it), OUTDATED (an
+    older snippet), or a core.hooksPath at a missing directory. hook status
+    exits 1 on any of these and /healthz lists them, so a dead hook is no
+    longer something only a reader of a log could find.
+    """
+    import os
+    if not repo_path.exists():
+        return False, "path not found"
+    if not (repo_path / ".git").is_dir():
+        return True, "not a git repo"
+    if _hooks_disabled(repo_path):
+        return True, "disabled (srclight.hooks=false)"
+    hooks_dir = _hooks_dir(repo_path)
+    if not hooks_dir.is_dir() and hooks_dir != repo_path / ".git" / "hooks":
+        return False, f"STALE: core.hooksPath points at missing {hooks_dir}"
+    statuses = []
+    healthy = True
+    for hook_name, make_snippet in _HOOK_SNIPPETS.items():
+        hf = hooks_dir / hook_name
+        if not hf.exists():
+            statuses.append(f"{hook_name} (MISSING)")
+            healthy = False
+            continue
+        text = hf.read_text()
+        if _HOOK_MARKER_START not in text:
+            label = "legacy codelight block" if _LEGACY_MARKER_START in text else "MISSING: no srclight block"
+            statuses.append(f"{hook_name} ({label})")
+            healthy = False
+            continue
+        blocks = _hook_blocks(text)
+        target = _hook_target(blocks[0].group(0)) if len(blocks) == 1 else None
+        if not blocks:
+            problem = "BROKEN: no end marker"
+        elif len(blocks) > 1:
+            problem = f"BROKEN: {len(blocks)} srclight blocks"
+        elif not _is_executable(target):
+            problem = f"STALE: {target} not executable"
+        elif not os.access(hf, os.X_OK):
+            problem = "NOT EXECUTABLE: git skips this hook"
+        elif blocks[0].group(0) != make_snippet(target):
+            problem = "OUTDATED: run srclight hook install"
+        else:
+            statuses.append(hook_name)
+            continue
+        statuses.append(f"{hook_name} ({problem})")
+        healthy = False
+    return healthy, ", ".join(statuses)
 
 
 def _install_hooks_in_repo(repo_path: Path, srclight_path: str, force: bool = False) -> str:
@@ -921,6 +1061,8 @@ def _install_hooks_in_repo(repo_path: Path, srclight_path: str, force: bool = Fa
     git_dir = repo_path / ".git"
     if not git_dir.is_dir():
         return f"  SKIP {repo_path.name}: not a git repo"
+    if _hooks_disabled(repo_path):
+        return f"  SKIP {repo_path.name}: disabled (srclight.hooks=false)"
 
     hooks_dir = _hooks_dir(repo_path)
     if hooks_dir == git_dir / "hooks":
@@ -929,25 +1071,21 @@ def _install_hooks_in_repo(repo_path: Path, srclight_path: str, force: bool = Fa
         # A core.hooksPath left pointing at a moved directory: git runs no
         # hooks at all, so writing .git/hooks would only look like a repair.
         return f"  FAIL {repo_path.name}: core.hooksPath points at missing {hooks_dir}"
+    else:
+        problem = _committable_hooks_dir(repo_path, hooks_dir)
+        if problem:
+            return f"  FAIL {repo_path.name}: {problem}"
 
-    snippets = {
-        "post-commit": _post_commit_snippet(srclight_path),
-        "post-checkout": _post_checkout_snippet(srclight_path),
-    }
-
-    installed = []
-    skipped = []
-    for hook_name, snippet in snippets.items():
-        if _write_hook_file(hooks_dir / hook_name, snippet, force=force):
-            installed.append(hook_name)
-        else:
-            skipped.append(hook_name)
+    installed = [
+        hook_name for hook_name, make_snippet in _HOOK_SNIPPETS.items()
+        if _write_hook_file(hooks_dir / hook_name, make_snippet, srclight_path, force=force)
+    ]
 
     # Ensure .srclight dir exists for log file
     (repo_path / ".srclight").mkdir(exist_ok=True)
 
-    # Ensure .srclight/ is in .gitignore (indexes + embeddings should never be committed)
-    _ensure_gitignore(repo_path)
+    # Indexes + embeddings should never be committed
+    _ensure_srclight_ignored(repo_path)
 
     if not installed:
         return f"  SKIP {repo_path.name}: hooks already installed"
@@ -998,18 +1136,25 @@ def hook_install(ws_name: str | None, force: bool):
         )
         sys.exit(1)
 
+    results = []
     if ws_name:
         from .workspace import WorkspaceConfig
         config = WorkspaceConfig.load(ws_name)
         for entry in config.get_entries():
             repo_path = Path(entry.path)
             if not repo_path.exists():
-                click.echo(f"  SKIP {entry.name}: path not found ({entry.path})")
-                continue
-            click.echo(_install_hooks_in_repo(repo_path, srclight_path, force=force))
+                results.append(f"  FAIL {entry.name}: path not found ({entry.path})")
+            else:
+                results.append(_install_hooks_in_repo(repo_path, srclight_path, force=force))
+            click.echo(results[-1])
     else:
         root = _find_repo_root(Path.cwd())
-        click.echo(_install_hooks_in_repo(root, srclight_path, force=force))
+        results.append(_install_hooks_in_repo(root, srclight_path, force=force))
+        click.echo(results[-1])
+    failed = sum(1 for r in results if r.lstrip().startswith("FAIL"))
+    if failed:
+        click.echo(f"Error: hooks could not be installed in {failed} repo(s).", err=True)
+        sys.exit(1)
 
 
 @hook.command("uninstall")
@@ -1168,7 +1313,11 @@ def hook_uninstall_agent(settings_path: str):
 @hook.command("status")
 @click.option("--workspace", "-w", "ws_name", help="Check all repos in a workspace")
 def hook_status(ws_name: str | None):
-    """Check if auto-reindex hooks are installed."""
+    """Check that auto-reindex hooks are installed and will run.
+
+    Exits 1 when any repo's hooks are missing, BROKEN, STALE, NOT EXECUTABLE
+    or OUTDATED, so cron and scripts can act on it.
+    """
     repos = []
     if ws_name:
         from .workspace import WorkspaceConfig
@@ -1179,42 +1328,19 @@ def hook_status(ws_name: str | None):
         root = _find_repo_root(Path.cwd())
         repos.append((root.name, root))
 
+    unhealthy = 0
     for name, repo_path in repos:
-        if not repo_path.exists():
-            click.echo(f"  {name:<20} path not found")
-            continue
-        hooks_dir = _hooks_dir(repo_path)
-        if not hooks_dir.is_dir() and hooks_dir != repo_path / ".git" / "hooks":
-            click.echo(f"  {name:<20} STALE: core.hooksPath points at missing {hooks_dir}")
-            continue
-        statuses = []
-        for hook_name in _HOOK_NAMES:
-            hf = hooks_dir / hook_name
-            if not hf.exists():
-                continue
-            text = hf.read_text()
-            if _HOOK_MARKER_START not in text:
-                if _LEGACY_MARKER_START in text:
-                    statuses.append(f"{hook_name} (legacy codelight block)")
-                continue
-            # The hook exits 0 whether or not its binary exists, so a marker
-            # alone does not mean auto-reindex runs.
-            blocks = _hook_blocks(text)
-            if not blocks:
-                statuses.append(f"{hook_name} (BROKEN: no end marker)")
-                continue
-            if len(blocks) > 1:
-                statuses.append(f"{hook_name} (BROKEN: {len(blocks)} srclight blocks)")
-                continue
-            target = _hook_target(blocks[0].group(0))
-            if not _is_executable(target):
-                statuses.append(f"{hook_name} (STALE: {target} not executable)")
-            else:
-                statuses.append(hook_name)
-        if statuses:
-            click.echo(f"  {name:<20} {', '.join(statuses)}")
-        else:
-            click.echo(f"  {name:<20} no hooks")
+        healthy, summary = _repo_hook_health(repo_path)
+        click.echo(f"  {name:<20} {summary}")
+        if not healthy:
+            unhealthy += 1
+    if unhealthy:
+        click.echo(
+            f"{unhealthy} repo(s) will not auto-reindex as installed. "
+            "Run `srclight hook install` there (or with --workspace).",
+            err=True,
+        )
+        sys.exit(1)
 
 
 # --- Config commands ---

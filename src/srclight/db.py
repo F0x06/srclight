@@ -636,12 +636,23 @@ class Database:
         self.conn.execute("DELETE FROM symbols WHERE file_id = ?", (file_id,))
 
     def get_symbol_by_name(self, name: str) -> SymbolRecord | None:
-        """Get first symbol matching exact name. Use get_symbols_by_name for all matches."""
+        """Get first symbol matching exact name. Use get_symbols_by_name for all matches.
+
+        In C and C++ a name resolves to both a declaration and a definition.
+        Edges hang off the definition, so an unordered LIMIT 1 landing on the
+        prototype makes callers and callees come back empty. Rank definitions
+        first, then prefer the row that carries edges.
+        """
         assert self.conn is not None
         row = self.conn.execute(
             """SELECT s.*, f.path as file_path FROM symbols s
                JOIN files f ON s.file_id = f.id
-               WHERE s.name = ? LIMIT 1""",
+               WHERE s.name = ?
+               ORDER BY CASE s.kind WHEN 'prototype' THEN 1 ELSE 0 END,
+                        (SELECT count(*) FROM symbol_edges e
+                          WHERE e.target_id = s.id OR e.source_id = s.id) DESC,
+                        s.id
+               LIMIT 1""",
             (name,),
         ).fetchone()
         if row is None:
@@ -1308,6 +1319,72 @@ class Database:
             })
         return results
 
+    def remember_embedding_model(self, model: str) -> None:
+        """Record the model this index embeds with, for flag-less runs."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('embed_model', ?)",
+            (model,),
+        )
+
+    def forget_embedding_model(self) -> None:
+        """Stop flag-less runs from embedding this index.
+
+        Recorded as an empty choice rather than a deleted row: the row's
+        absence means "never recorded" and falls back to counting existing
+        embeddings, which would resurrect the model this is meant to drop.
+        """
+        self.remember_embedding_model("")
+
+    def embedding_model_forgotten(self) -> bool:
+        """Whether this index was explicitly told to stop embedding.
+
+        Distinct from "no model recorded": both make detect_embedding_model
+        return None, but only this one must also outrank SRCLIGHT_EMBED_MODEL
+        — otherwise the off switch does not work for the very user the docs
+        told to export it.
+        """
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'embed_model'"
+        ).fetchone()
+        return row is not None and not row["value"]
+
+    def bump_embedding_cache_version(self) -> None:
+        """Mark the .npy sidecar stale without touching any embedding.
+
+        A run that skips embedding still deletes and re-creates symbols, and
+        symbol_embeddings cascades with them. Only upsert_embedding bumps the
+        version, so the sidecar kept describing the previous index — and
+        symbols.id is a rowid, reused after deletion, so a stale sidecar
+        serves one symbol's score under another symbol's identity.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            """INSERT INTO schema_info (key, value) VALUES ('embedding_cache_version', '1')
+               ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)""",
+        )
+
+    def detect_embedding_model(self) -> str | None:
+        """The embedding model this index was built with, if any."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'embed_model'"
+        ).fetchone()
+        if row is not None:
+            # Recorded — including recorded as empty, which means the user
+            # asked this index to stop embedding. Authoritative either way.
+            return row["value"] or None
+
+        # Indexes embedded before the choice was recorded: infer it from the
+        # rows. An index can hold several models (a switch that failed part
+        # way through), so the one covering the most symbols wins.
+        row = self.conn.execute(
+            """SELECT model, COUNT(*) AS n FROM symbol_embeddings
+               GROUP BY model ORDER BY n DESC, model ASC LIMIT 1"""
+        ).fetchone()
+        return row["model"] if row else None
+
     def embedding_stats(self) -> dict:
         """Get embedding statistics."""
         assert self.conn is not None
@@ -1722,6 +1799,7 @@ class Database:
         language: str | None = None,
         kind: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Search for a regex pattern within symbol source code.
 
@@ -1730,6 +1808,9 @@ class Database:
         Each result carries ``match_count`` (how many lines in the symbol matched)
         and ``matched_lines`` — per matching line, its offset within the symbol,
         its absolute file line, the line text, and the substring the pattern hit.
+        ``offset`` skips that many matching symbols before collecting, so a
+        caller that was truncated can page. Ordering is stable (path, then
+        start line) as long as the index does not change between calls.
         """
         assert self.conn is not None
 
@@ -1755,6 +1836,7 @@ class Database:
 
         compiled = re.compile(pattern)
         results: list[dict[str, Any]] = []
+        seen = 0  # matching symbols passed over, including those skipped by offset
 
         for row in self.conn.execute(sql, params):
             content = row["content"]
@@ -1774,6 +1856,9 @@ class Database:
                     })
 
             if matched_lines:
+                seen += 1
+                if seen <= offset:
+                    continue
                 sym = self._row_to_symbol(row)
                 results.append({
                     "name": sym.name,
@@ -1794,6 +1879,10 @@ class Database:
     def commit(self) -> None:
         assert self.conn is not None
         self.conn.commit()
+
+    def rollback(self) -> None:
+        assert self.conn is not None
+        self.conn.rollback()
 
 
 def content_hash(data: bytes) -> str:

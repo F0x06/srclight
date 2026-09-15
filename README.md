@@ -27,7 +27,7 @@ AI coding agents (Claude Code, Cursor, etc.) spend **40-60% of their tokens on o
 - **Minimal dependencies** — single SQLite file per repo, no Docker/Redis/vector DB
 - **Fully offline** — no API calls, works air-gapped (Ollama local embeddings)
 - **Incremental** — only re-indexes changed files (content hash detection)
-- **11 languages** — Python, C, C++, C#, JavaScript, TypeScript, PHP, Dart, Swift, Kotlin, Java, Go
+- **19 languages** — Python, C, C++, C#, Java, Kotlin, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Lua, Bash, SQL, Groovy, CMake, Markdown
 - **10 document formats** — PDF, DOCX, XLSX, HTML, CSV/TSV, email (.eml), images (PNG/JPG/SVG/etc.), plain text, RST, Markdown
 - **Optional OCR** — PaddleOCR for scanned/image-only PDF pages; pytesseract for images
 - **4 search modes** — symbol names, source code (trigram), documentation (stemmed), semantic (embeddings)
@@ -131,6 +131,25 @@ srclight serve
 
 > **Note:** `srclight index` automatically adds `.srclight/` to your `.gitignore`. Index databases and embedding files can be large and should never be committed.
 
+### Running tools from the shell
+
+Every MCP tool is reachable from the CLI, which is how an agent with a
+sandbox can query the index without the answer ever entering its context:
+
+```bash
+srclight tool --list                    # every tool and what it does
+srclight tool find_pattern --help       # arguments, from the tool's own schema
+srclight tool find_pattern --pattern 'this->timer' --kind function --limit 80
+```
+
+Output is the tool's JSON on stdout and nothing else, so it pipes. Exit codes
+are 0 on success, 1 when the tool reports an error, 2 on a usage error — a
+usage error writes nothing to stdout and says why on stderr.
+
+The command reads the server's own tool registry, so it always matches the
+tools your MCP client sees — and a tool renamed on the MCP side is renamed
+here too.
+
 ## Semantic Search (Embeddings)
 
 Srclight supports embedding-based semantic search for natural language queries like "find code that handles authentication" or "where is the database connection pool".
@@ -149,6 +168,57 @@ srclight index --embed qwen3-embedding
 # Or index workspace with embeddings
 srclight workspace index -w myworkspace --embed qwen3-embedding
 ```
+
+### Choosing the Model Once
+
+`--embed` only has to be passed once per index. The index records the model
+and every later run reuses it — including the flag-less `srclight index .`
+the git hooks run on each commit, and the MCP `reindex` tool. Without that,
+every symbol added after the first run stays unembedded until someone
+remembers the flag.
+
+```bash
+srclight index --embed qwen3-embedding   # first run: records the model
+srclight index                           # later runs: reuse it, no flag
+```
+
+The recorded name is provider-qualified, so the second run reports
+`Embedding model: ollama:qwen3-embedding (from the existing index)`.
+
+For indexes that have **no** model recorded yet, `SRCLIGHT_EMBED_MODEL`
+supplies one:
+
+```bash
+export SRCLIGHT_EMBED_MODEL=qwen3-embedding
+srclight index                           # a fresh index embeds with it
+```
+
+Resolution order is `--embed` > the model recorded in the index >
+`SRCLIGHT_EMBED_MODEL`. The variable comes last on purpose: it is a default
+for new indexes, never an override. Ahead of the recorded model, exporting
+it once would make the next commit in an unrelated repo re-embed every
+symbol it holds, silently, from a background hook. Switching an existing
+index stays an explicit `--embed`.
+
+Two escape hatches:
+
+```bash
+srclight index --no-embed             # skip embedding for this run only
+srclight index --forget-embed-model   # stop embedding this index for good
+```
+
+`--forget-embed-model` is the off switch for the hooks, whose command line
+is fixed: after it, commits index without ever calling the embedding model,
+until you pass `--embed` again. Over MCP, `reindex(embed=False)` is the
+per-call equivalent of `--no-embed`.
+
+Note that skipping is not free. Reindexing a changed file drops the
+embeddings of the symbols it replaces, and a skipped pass does not put them
+back — semantic coverage decays on exactly the files being edited. Ask
+`embedding_status()` what an index will do: `configured_model` is the model
+the next flag-less run resolves to — the whole chain, environment variable
+included — and null means it will not embed. Single-repo mode only: in a
+workspace each project records its own, so the field is not reported.
 
 ### How It Works
 
@@ -327,9 +397,9 @@ Any MCP-compatible client can connect to the SSE endpoint:
 http://127.0.0.1:8742/sse
 ```
 
-## MCP Tools (42)
+## MCP Tools (43)
 
-Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes built-in instructions that guide AI agents on which tool to use and when — agents receive a session protocol, tool selection guide, and `project` parameter documentation automatically on connection.
+Srclight exposes 43 MCP tools organized in eight tiers. The MCP server includes built-in instructions that guide AI agents on which tool to use and when — agents receive a session protocol, tool selection guide, and `project` parameter documentation automatically on connection.
 
 ### Tier 1: Instant Orientation
 | Tool | What it does |
@@ -339,6 +409,7 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | `get_symbol(name)` | Full source code + metadata for a symbol |
 | `get_signature(name)` | Just the signature (lightweight) |
 | `symbols_in_file(path)` | Table of contents for a file |
+| `find_pattern(pattern, limit, offset)` | Regex search inside symbol bodies; says when it truncated |
 | `list_projects()` | All projects in workspace with stats |
 
 ### Tier 2: Relationship Graph
@@ -350,6 +421,8 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | `get_implementors(interface)` | All classes implementing an interface |
 | `get_tests_for(name)` | Test functions covering a symbol |
 | `get_type_hierarchy(name)` | Inheritance tree (base classes + subclasses) |
+| `find_imports(path)` | Import statements in a file, resolved to indexed files |
+| `find_dead_code(kind)` | Symbols nothing calls or references |
 
 ### Tier 2b: Community & Impact Analysis
 | Tool | What it does |
@@ -387,11 +460,21 @@ Srclight exposes 42 MCP tools organized in seven tiers. The MCP server includes 
 | Tool | What it does |
 |------|-------------|
 | `index_status()` | Index freshness and stats |
-| `reindex()` | Trigger incremental re-index |
+| `check_freshness(paths)` | Is the index current for these files, or for all of them? |
+| `show_status(message)` | Show the srclight dashboard window and return current status |
+| `reindex(embed=True)` | Trigger incremental re-index; `embed=False` skips the embedding pass (and lets semantic coverage decay) |
 | `embedding_health()` | Check if the embedding provider (Ollama, etc.) is reachable |
 | `setup_guide()` | Structured setup instructions for agents and users |
 | `server_stats()` | Server uptime and process info |
 | `restart_server()` | Request server restart (SSE only) |
+
+### Tier 7: Learnings & Session Memory
+| Tool | What it does |
+|------|-------------|
+| `record_learning(kind, content)` | Record a decision, correction, discovery, pattern, blocker or convention |
+| `relevant_learnings(query)` | Find recorded learnings by keyword + semantic search |
+| `learning_stats(days)` | Counts by kind over time |
+| `conversation_summary(session_id, task_summary)` | Record what a session did, with token and cost figures |
 
 In workspace mode, `search_symbols`, `get_symbol`, `codebase_map`, and `hybrid_search` accept an optional `project` filter. Graph/git/build/community tools require `project` in workspace mode.
 
@@ -499,7 +582,7 @@ srclight hook install --workspace myworkspace
 srclight hook uninstall
 ```
 
-The hooks run `srclight index` in the background after each commit and branch switch.
+The hooks run `srclight index` in the background after each commit and branch switch. On a repo whose index has a recorded embedding model, that refreshes embeddings too — see [Choosing the Model Once](#choosing-the-model-once) for the off switch.
 
 ## How It Works
 
@@ -544,8 +627,8 @@ A survey of 50+ MCP code intelligence servers across all major registries (Offic
 | Multi-repo workspace | ATTACH+UNION | None | None | None |
 | Infrastructure required | `pip install`, SQLite | None | SCIP indexer | Docker, Milvus, OpenAI API |
 | Fully local / private | Yes, zero API calls | Yes | Yes | No (needs OpenAI) |
-| Languages | 11 | Any (regex) | 5 (SCIP) | Any (chunking) |
-| MCP tools | 42 | 2 (grep, glob) | 80+ | ~10 |
+| Languages | 19 | Any (regex) | 5 (SCIP) | Any (chunking) |
+| MCP tools | 43 | 2 (grep, glob) | 80+ | ~10 |
 
 Unlike grep-based tools, srclight builds a persistent index with structured lookups. Unlike cloud-based solutions, everything runs locally — your code never leaves your machine. Unlike IDE plugins, srclight works with any MCP client.
 

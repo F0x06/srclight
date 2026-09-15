@@ -193,16 +193,17 @@ The `project` parameter filters to one repo. Omit it to search all.
 2. The `post-commit` hook fires (background, non-blocking)
 3. `srclight index .` runs with `flock` (prevents concurrent re-indexes)
 4. Changed files are re-parsed (tree-sitter), FTS5 indexes updated
-5. Output logged to `.srclight/reindex.log`
+5. Embeddings are refreshed too, if this index has a recorded model (or `SRCLIGHT_EMBED_MODEL` reaches the hook and the index has recorded nothing)
+6. Output logged to `.srclight/reindex.log`
 
-**Note**: The hook does NOT re-embed. FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is always fresh. Semantic search for new/changed symbols requires a manual embed pass (see below).
+**Note**: step 5 is why `--embed` is passed only once. An index that has never embedded stays keyword-only, and `--forget-embed-model` takes an index back to that state. If the embedding provider is unreachable when the hook fires, the run logs a warning and keeps the parse work: FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is never held hostage to the embedding model.
 
 ### What Happens on Branch Switch
 
 1. `git checkout other-branch` triggers `post-checkout` hook
 2. Only fires on branch checkouts (not file checkouts) and only when HEAD changes
 3. Same background `srclight index .` as post-commit
-4. FTS5 indexes updated for all files that differ between branches
+4. FTS5 indexes updated for all files that differ between branches, and embeddings with them when a model resolves (see post-commit, step 5)
 
 ### Re-Embedding After Significant Changes
 
@@ -222,9 +223,11 @@ srclight workspace index -w myworkspace -p project-name --embed qwen3-embedding
 
 Embedding is incremental — only symbols whose `body_hash` changed get re-embedded. The `.npy` sidecar is rebuilt automatically after embedding.
 
+`--embed` is only needed the first time: the index records the model and reuses it on every later run, so a bare `srclight index` re-embeds too. `SRCLIGHT_EMBED_MODEL` picks a model for indexes that have none recorded — it is a default, not an override, so it never silently switches a repo that already embeds. `--no-embed` skips embedding for a single run; `--forget-embed-model` stops this index from embedding until `--embed` is passed again.
+
 ### Automating Embedding Refresh with Cron
 
-Git hooks keep the FTS5 index fresh on every commit, but they do **not** re-embed — embedding requires calling the embedding model (e.g. Ollama) and would slow down every commit. For teams that rely on `hybrid_search` or `semantic_search`, a nightly cron job keeps embeddings current without manual intervention.
+Git hooks reindex in the background with a bare `srclight index .`, so they re-embed whenever a model resolves — the one recorded in the index, or `SRCLIGHT_EMBED_MODEL` if the hook's environment carries it and the index has recorded nothing. `srclight index --forget-embed-model` records a deliberate "off" that outranks the variable. That covers day-to-day drift. A nightly cron job is still useful to catch repos whose embedding provider was down at commit time, and to install hooks in newly added repos.
 
 ```bash
 # Add to crontab (crontab -e)
@@ -249,10 +252,10 @@ tail -50 /tmp/srclight-embed-cron.log
 | Layer | What triggers it | What it does | Speed |
 |-------|-----------------|--------------|-------|
 | **FTS5 index** | Git hooks (`post-commit`, `post-checkout`) | Re-parses changed files via tree-sitter, updates symbol/edge tables and FTS5 indexes | 1-5s per commit |
-| **Embeddings** | Manual `--embed` or cron | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
+| **Embeddings** | Any index run once the model is known (hooks, cron, `--embed`) | Computes embeddings only for symbols whose `body_hash` changed since last embed | ~1s per 25 symbols |
 | **Vector cache** | Automatic after embedding | Rebuilds `.npy` sidecar files for GPU/CPU-resident search | <1s |
 
-The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag until the next `--embed` pass. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
+The index and embeddings are separate concerns: FTS5 is always current (via hooks), embeddings lag whenever no model resolves for a run (`--no-embed`, `--forget-embed-model`, or an index that has never embedded) or the provider is unreachable at index time — that last case logs a warning and moves on, keeping the parse work. `search_symbols` uses FTS5 only (always fresh). `hybrid_search` combines both — if embeddings are stale, the keyword half still returns current results.
 
 ## Document Extraction
 

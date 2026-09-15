@@ -10,6 +10,8 @@ import fnmatch
 import hashlib
 import json
 import logging
+import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -116,6 +118,9 @@ DEFAULT_IGNORE = [
 # Max file size to index (1 MB)
 MAX_FILE_SIZE = 1_000_000
 
+# Embedding model for indexes that have none recorded — see resolve_embed_model
+EMBED_MODEL_ENV = "SRCLIGHT_EMBED_MODEL"
+
 
 @dataclass
 class IndexStats:
@@ -127,6 +132,7 @@ class IndexStats:
     symbols_extracted: int = 0
     edges_created: int = 0
     errors: int = 0
+    symbols_embedded: int = 0
     elapsed_seconds: float = 0.0
 
 
@@ -138,6 +144,47 @@ class IndexConfig:
     max_doc_file_size: int = 50_000_000  # 50 MB for documents (PDF, DOCX, etc.)
     languages: list[str] | None = None  # None = all supported
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
+    disable_embeddings: bool = False  # --no-embed: index without touching embeddings
+
+
+def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
+    """Pick the embedding model for a run.
+
+    Priority: the explicit model (--embed) > the model the index already
+    holds > SRCLIGHT_EMBED_MODEL. The middle one is what keeps embeddings
+    alive across the flag-less reindexes run by the git hooks and the MCP
+    server — without it, every symbol added after the first `--embed` run
+    stays unembedded.
+
+    The environment variable comes LAST on purpose: it is a default for
+    indexes that have no model yet, not an override. Ahead of the recorded
+    model, exporting it once — the natural way to set a default — would make
+    the next commit in an unrelated repo re-embed every symbol it holds,
+    silently, from a detached background hook, against a metered API in the
+    paid case.
+    Switching an existing index stays an explicit `--embed`.
+
+    `disable_embeddings` opts out of all three.
+    """
+    if config.disable_embeddings:
+        return None
+
+    explicit = (config.embed_model or "").strip()
+    if explicit:
+        return explicit
+
+    recorded = db.detect_embedding_model()
+    if recorded:
+        return recorded
+
+    # An index told to forget stays off, whatever the environment says. The
+    # docs send users to export the variable and the hooks inherit it, so
+    # letting it win here would leave the one person who most needs the off
+    # switch — the one paying a metered provider on every commit — without one.
+    if db.embedding_model_forgotten():
+        return None
+
+    return os.environ.get(EMBED_MODEL_ENV, "").strip() or None
 
 
 def _should_ignore(path: Path, root: Path, patterns: list[str]) -> bool:
@@ -269,7 +316,339 @@ def _extract_signature(source_bytes: bytes, node: Node, lang: str) -> str | None
                        name_node.end_byte)
             return source_bytes[node.start_byte:sig_end].decode("utf-8", errors="replace").strip()
 
+    elif lang == "lua":
+        # Lua declares no return type, so the parameter list ends the signature.
+        # It may hang off the node itself (`function f(a)`) or off the value it
+        # is assigned (`f = function(a)`), which is the same definition.
+        params = _lua_parameters(node)
+        if params is not None:
+            return source_bytes[node.start_byte:params.end_byte].decode(
+                "utf-8", errors="replace").strip()
+
     return None
+
+
+def _lua_nameless_definition(node: Node) -> bool:
+    """True when a definition has no name a caller could write.
+
+    A computed key — `{ [k] = function() end }` — is one: `k` holds the key
+    rather than being it. A string key does name the function, and the query
+    captures it from inside the string.
+    """
+    if node.type == "field":
+        if node.child_count == 0 or node.child(0).type != "[":
+            return False
+        key = node.child_by_field_name("name")
+        return key is None or key.type != "string"
+
+    # An assignment target that is not a path names nothing either: a call, a
+    # parenthesised expression. Its source text would carry newlines and
+    # punctuation into the name index in place of a name. This asks the shape
+    # of the target, not whether a dotted path can be spelled from it —
+    # `t["my-key"]` has no dotted form and still names its function.
+    if node.type == "variable_declaration":
+        inner = node.named_children[0] if node.named_children else None
+        return inner is None or _lua_nameless_definition(inner)
+
+    if node.type == "assignment_statement":
+        return not _lua_is_path(node.child_by_field_name("name"))
+
+    return False
+
+
+def _lua_is_path(node: Node | None) -> bool:
+    """Whether a node is a name or a chain of index expressions ending in one."""
+    while node is not None and node.type != "identifier":
+        if node.type not in (
+            "dot_index_expression", "bracket_index_expression", "method_index_expression",
+        ):
+            return False
+        node = node.child_by_field_name("table")
+    return node is not None
+
+
+def _lua_definition_path(node: Node) -> str | None:
+    """The full path a Lua definition hangs off, e.g. `Stack:pop` or `von.Entity`.
+
+    The name a call site writes is not always the whole path, so the path is
+    kept as the qualified name. `t["k"]` is written as the dotted path it is
+    equivalent to: a qualified name carrying quotes and brackets matches
+    nothing a reader or a caller would write.
+    """
+    if node.type == "field":
+        name = _lua_key_name(node.child_by_field_name("name"))
+        if name is None:
+            return None
+        table = _lua_enclosing_table(node)
+        return f"{table}.{name}" if table else name
+
+    if node.type == "variable_declaration":
+        inner = node.named_children[0] if node.named_children else None
+        return _lua_definition_path(inner) if inner is not None else None
+
+    return _lua_target_path(node.child_by_field_name("name"))
+
+
+# A key only joins a dotted path if it could have been written as one.
+_LUA_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _lua_key_name(node: Node | None) -> str | None:
+    """A table key as a path segment, or None if it cannot be written as one."""
+    if node is None:
+        return None
+    if node.type == "string":
+        content = node.child_by_field_name("content")
+        node_text = content.text if content is not None else b""
+    elif node.type == "identifier":
+        node_text = node.text
+    else:
+        return None
+    name = node_text.decode("utf-8", errors="replace")
+    return name if _LUA_IDENTIFIER.match(name) else None
+
+
+def _lua_target_path(node: Node | None) -> str | None:
+    """The dotted path of an assignment target, e.g. `t.a.b` for `t["a"]["b"]`.
+
+    Walked iteratively: a generated file can carry a path thousands of segments
+    long, and recursing over one exhausts the stack.
+
+    None for anything that is not a path — a call, a parenthesised expression, a
+    computed key. Such a target has no name a reader would write, and its source
+    text can carry newlines and punctuation into the name index.
+    """
+    segments: list[tuple[str, str]] = []
+    while node is not None and node.type != "identifier":
+        if node.type == "method_index_expression":
+            separator, key = ":", node.child_by_field_name("method")
+        elif node.type in ("dot_index_expression", "bracket_index_expression"):
+            separator, key = ".", node.child_by_field_name("field")
+        else:
+            return None
+        name = _lua_key_name(key)
+        if name is None:
+            return None
+        segments.append((separator, name))
+        node = node.child_by_field_name("table")
+
+    if node is None:
+        return None
+    path = node.text.decode("utf-8", errors="replace")
+    for separator, name in reversed(segments):
+        path += separator + name
+    return path
+
+
+def _lua_enclosing_table(field: Node, depth: int = 0) -> str | None:
+    """The path of the table a literal's field belongs to, when it has one.
+
+    `local encode = { ["Entity"] = function() end }` gives `encode`, so that two
+    tables holding the same key do not collapse onto one qualified name. A table
+    nested in another field answers with that field's own path, which is where
+    the depth limit comes in — a path deeper than this says nothing useful.
+    """
+    if depth > 16:
+        return None
+    table = field.parent
+    if table is None or table.type != "table_constructor":
+        return None
+
+    holder = table.parent
+    if holder is None:
+        return None
+
+    if holder.type == "field":                       # a table inside a table
+        name = _lua_key_name(holder.child_by_field_name("name"))
+        if name is None:
+            return None
+        outer = _lua_enclosing_table(holder, depth + 1)
+        return f"{outer}.{name}" if outer else name
+
+    if holder.type != "expression_list":
+        return None
+    assignment = holder.parent
+    if assignment is None or assignment.type != "assignment_statement":
+        return None
+
+    # `local P, Q = {…}, {…}` — the table's own position picks its name.
+    values = list(holder.named_children)
+    variables = next(
+        (c for c in assignment.named_children if c.type == "variable_list"), None,
+    )
+    if variables is None or table not in values:
+        return None
+    position = values.index(table)
+    targets = list(variables.named_children)
+    if position >= len(targets):
+        return None
+    return _lua_target_path(targets[position])
+
+
+def _lua_parameters(node: Node) -> Node | None:
+    """The parameter list of the function a Lua definition node defines.
+
+    The route is spelled out per shape rather than searched: a general descent
+    finds whichever function comes first in the tree, which for an assignment
+    is the one in the *target* if any (`(function(a) end)().x = function(b) end`
+    gives `a`), and on a long dotted path it recurses deep enough to exhaust
+    the stack — losing not just the symbol but every symbol in the file.
+    """
+    params = node.child_by_field_name("parameters")
+    if params is not None:                       # function f(a) / function(a)
+        return params
+
+    if node.type == "variable_declaration":      # local f = function(a)
+        inner = node.named_children[0] if node.named_children else None
+        return _lua_parameters(inner) if inner is not None else None
+
+    if node.type == "assignment_statement":      # T.f = function(a)
+        for child in node.named_children:
+            if child.type == "expression_list":
+                value = child.child_by_field_name("value")
+                return _lua_parameters(value) if value is not None else None
+        return None
+
+    if node.type == "field":                     # { f = function(a) }
+        value = node.child_by_field_name("value")
+        return _lua_parameters(value) if value is not None else None
+
+    return None
+
+
+# `\b` is Unicode-aware, so a boundary depends on characters this module must
+# not assume are ASCII: `caféhandler` and `123handler` contain no boundary before
+# `handler`, and a scanner that simply looked for identifier runs would report a
+# name that is really part of a larger word.
+_IS_WORD_CHAR = re.compile(r"\w").match
+# Identifier runs, as candidate starting points. The classes are Unicode: Python
+# and C# both allow `émetteur` as an identifier, and an ASCII-only head would
+# push every such name off the grouped path and back onto a scan of the whole
+# body, which is the cost this grouping exists to remove. `[^\W\d]` is a word
+# character that is not a digit.
+#
+# The lookbehind IS the guard for these positions, not a filter: the walk does
+# not re-check the leading boundary. A run starts on a word character and the
+# lookbehind refuses a word character before it, so exactly one side is a word
+# character — `\b`, by construction. Relax it and names inside larger words
+# (`123handler`, `caféhandler`) start matching.
+_IDENT_RUN_RE = re.compile(r"(?<!\w)[^\W\d]\w*")
+_LEADING_RUN_RE = re.compile(r"[^\W\d]\w*")
+
+
+def _on_boundary(content: str, index: int) -> bool:
+    """`\b` at `index`: exactly one side is a word character."""
+    before = index > 0 and _IS_WORD_CHAR(content[index - 1]) is not None
+    after = index < len(content) and _IS_WORD_CHAR(content[index]) is not None
+    return before != after
+
+
+def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
+    """Return a function mapping a symbol body to the known names it references.
+
+    Matching is leftmost, longest-at-that-position and non-overlapping: where
+    several names match at the same spot the longest one wins, and the shorter
+    names inside it are not reported. `Widget::~Widget` in a destructor body
+    therefore yields the destructor, never a bare `Widget`.
+
+    An alternation of every name expresses that directly, but Python's re
+    engine walks alternatives one at a time at each position, so the cost grows
+    with the size of the name set rather than with the body being scanned. On a
+    codebase with tens of thousands of symbols it dominates indexing entirely.
+
+    So group the names by their leading identifier instead. A name can only
+    begin where an identifier run begins on a boundary, so the run under the
+    cursor selects a handful of candidates by dictionary lookup, and the
+    longest one that the body actually starts with -- and that ends on a
+    boundary -- wins. `Vec<T>::push_back` and `Foo::operator+=` need no special
+    handling: they group under `Vec` and `Foo` like everything else, and the
+    punctuation is just part of the string being compared.
+
+    One scan, one cursor. Splitting the work over several passes and merging
+    the results afterwards is NOT equivalent, however carefully the merge is
+    written: once a match is accepted, the search has to RESUME inside what the
+    other passes had already scanned. `Registry<T>::Lookup::Inner::Leaf` is the
+    case that proves it -- accepting `Registry<T>::Lookup` must leave
+    `Inner::Leaf` still findable.
+    """
+    # Names that do not begin with an identifier character (extraction can
+    # produce a few). They cannot be reached from an identifier run, so they
+    # are located directly.
+    unanchored: list[str] = []
+    grouping: dict[str, list[str]] = {}
+    for name in names:
+        head = _LEADING_RUN_RE.match(name)
+        if head is None:
+            unanchored.append(name)
+        else:
+            grouping.setdefault(head.group(0), []).append(name)
+    # Longest first, so the first candidate that matches at a position is the
+    # one the alternation would have chosen. Frozen into tuples: the scan hands
+    # these lists straight to the caller's walk, and a shared list that anything
+    # could append to is a trap waiting for the next change.
+    buckets = {
+        head: tuple(sorted(candidates, key=len, reverse=True))
+        for head, candidates in grouping.items()
+    }
+
+    def anchored_candidates(content: str):
+        """Identifier runs, in order, with the names that could start there.
+
+        The lookbehind in _IDENT_RUN_RE has already established the leading
+        boundary — the run begins on an identifier character and the character
+        before it is not a word character — so the walk need only check where
+        each candidate ENDS.
+        """
+        for run in _IDENT_RUN_RE.finditer(content):
+            names_here = buckets.get(run.group(0))
+            if names_here is not None:
+                yield run.start(), names_here
+
+    def all_candidates(content: str):
+        """The same, plus the names that no identifier run can reach.
+
+        Only used when such names exist. They carry no boundary guarantee, so
+        they are filtered here rather than in the walk.
+
+        Several of them can start at the SAME position, and the walk takes the
+        first candidate that matches — so they have to be grouped per position
+        and ordered longest first, exactly as the buckets are. Emitting them one
+        by one left the order to however the name set happened to iterate, and
+        `émetteur` would beat `émetteur.envoyer` about half the time.
+        """
+        by_start: dict[int, list[str]] = {}
+        for name in unanchored:
+            at = content.find(name)
+            while at != -1:
+                if _on_boundary(content, at):
+                    by_start.setdefault(at, []).append(name)
+                at = content.find(name, at + 1)
+
+        found_at = list(anchored_candidates(content))
+        found_at.extend(
+            (start, tuple(sorted(names_here, key=len, reverse=True)))
+            for start, names_here in by_start.items()
+        )
+        found_at.sort(key=lambda candidate: candidate[0])
+        return found_at
+
+    def match(content: str) -> set[str]:
+        candidates = all_candidates(content) if unanchored else anchored_candidates(content)
+
+        found: set[str] = set()
+        cursor = 0
+        for start, names_here in candidates:
+            if start < cursor:
+                continue
+            for name in names_here:
+                end = start + len(name)
+                if content.startswith(name, start) and _on_boundary(content, end):
+                    found.add(name)
+                    cursor = end
+                    break
+        return found
+
+    return match
 
 
 def _kind_from_capture(capture_name: str) -> str:
@@ -294,6 +673,14 @@ def _kind_from_capture(capture_name: str) -> str:
         "define": "macro",
         "proto": "prototype",
         "qproto": "prototype",
+        "ptrfn": "function",   # C/C++ pointer return types
+        "ptrfn2": "function",
+        "ptrproto": "prototype",
+        "ptrproto2": "prototype",
+        "ptrmethod": "method",
+        "ptrmethod2": "method",
+        "ptrfield_fn": "method",
+        "ptrfield_fn2": "method",
         "trait": "trait",
         "impl": "impl",
         "template": "template",
@@ -368,6 +755,10 @@ def _build_qualified_name(symbol_name: str | None, node: Node, lang: str) -> str
         if scopes:
             return ".".join(scopes + [symbol_name])
         return symbol_name
+    elif lang == "lua":
+        # The table a function hangs off is written on the definition itself,
+        # not in an enclosing scope node the way a class body is.
+        return _lua_definition_path(node) or symbol_name
     else:
         scopes = _get_enclosing_scope(node)
         if scopes:
@@ -635,11 +1026,29 @@ class Indexer:
             except Exception:
                 logger.warning("Community detection failed", exc_info=True)
 
-        # Build embeddings (optional, only if embed_model configured)
-        if self.config.embed_model:
-            n_embedded = self._build_embeddings(self.config.embed_model)
-            if n_embedded > 0:
-                logger.info("Embedded %d symbols with %s", n_embedded, self.config.embed_model)
+        # Make the file pass durable BEFORE embedding. index() otherwise runs
+        # as one transaction opened at the first file upsert, so the embedding
+        # pass — minutes of HTTP calls — held the write lock the whole time and
+        # took the parse work down with it if it failed. A second writer (the
+        # git hook firing while the MCP server embeds) got 'database is locked'
+        # and lost its own run: no busy_timeout is set.
+        self.db.commit()
+
+        # Build embeddings (optional, only if a model is configured or known)
+        embed_model = resolve_embed_model(self.db, self.config)
+        if embed_model:
+            stats.symbols_embedded = self._build_embeddings(embed_model)
+            if stats.symbols_embedded > 0:
+                logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
+
+        # Symbols moved and nothing was embedded: the sidecar now describes a
+        # database that has changed, and symbols.id is a rowid reused after
+        # deletion, so leaving it valid serves one symbol's score under
+        # another symbol's identity. What matters is that the pass wrote
+        # nothing — not why. A configured model whose provider is down, and a
+        # reindex that only removed files, both land here.
+        if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
+            self._invalidate_sidecar()
 
         # Update index state
         git_head = _get_git_head(root)
@@ -727,6 +1136,16 @@ class Indexer:
             # For templates without a name, extract from the inner declaration
             if symbol_name is None and kind == "template":
                 symbol_name = _extract_template_name(def_node)
+
+            # Error recovery inserts MISSING nodes whose text is empty, and a
+            # path left dangling by one — `M. = function() end` — ends on its
+            # separator. An empty name is not NULL, so it would slip past every
+            # IS NOT NULL filter and reach the name index.
+            if symbol_name == "" or (symbol_name or "").endswith((".", ":")):
+                continue
+
+            if lang == "lua" and _lua_nameless_definition(def_node):
+                continue
 
             raw_symbols.append((def_node, kind, symbol_name))
 
@@ -1000,15 +1419,9 @@ class Indexer:
             if len(syms) <= MAX_SYMBOL_FANOUT
         }
 
-        # Pre-compile regex
-        sorted_names = sorted(filtered_names.keys(), key=len, reverse=True)
-        if not sorted_names:
+        if not filtered_names:
             return 0
-
-        import re
-        pattern = re.compile(
-            r"\b(" + "|".join(re.escape(n) for n in sorted_names) + r")\b"
-        )
+        match_names = build_name_matcher(set(filtered_names))
 
         def _dir_of(path: str) -> str:
             """Get directory component of a path."""
@@ -1107,7 +1520,7 @@ class Indexer:
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
 
-            referenced_names = set(pattern.findall(content))
+            referenced_names = match_names(content)
             referenced_names.discard(source_name)
 
             imported = _imports_for(source_file, row["language"])
@@ -1146,7 +1559,6 @@ class Indexer:
         Returns the number of edges created.
         """
         assert self.db.conn is not None
-        import re
 
         # Get all class/struct symbols
         class_rows = self.db.conn.execute(
@@ -1223,6 +1635,24 @@ class Indexer:
 
         return edge_count
 
+    def _invalidate_sidecar(self) -> None:
+        """Mark the .npy sidecar stale, if this index has one to invalidate.
+
+        Keyed on the sidecar's existence rather than on rows in
+        symbol_embeddings: a reindex that removes every embedded file leaves
+        that table empty while the sidecar still lists the deleted symbols.
+        """
+        from .vector_cache import VectorCache
+
+        try:
+            if VectorCache(self.config.root / ".srclight").sidecar_exists():
+                self.db.bump_embedding_cache_version()
+        except Exception:
+            # Not a detail: a sidecar left valid over a changed index serves
+            # one symbol's score under another symbol's identity, because
+            # rowids are reused. Say so at a level people see.
+            logger.warning("Could not invalidate the embedding sidecar", exc_info=True)
+
     def _build_embeddings(self, model_spec: str) -> int:
         """Generate embeddings for symbols that need them.
 
@@ -1256,21 +1686,47 @@ class Indexer:
             logger.info("  Embedding batch %d/%d (%.0fs elapsed, ~%.0fs remaining)",
                         batch_num, total, elapsed, remaining)
 
+        # Nothing below may escape this method. Embedding is a best-effort
+        # extra: the index itself is already committed, and every caller —
+        # the CLI, the MCP reindex tool, and above all the git hooks, which
+        # run flag-less on every commit — must survive a provider that is
+        # down, slow, or serving a model that does not exist.
         try:
             results = embed_symbols(provider, symbols, on_progress=_on_progress)
-        except ConnectionError as e:
-            logger.error("Embedding failed: %s", e)
+
+            if not results:
+                # embed_symbols swallows per-batch failures and returns [], so
+                # an empty list means the provider is unreachable as often as
+                # it means there was nothing to do. Stop here either way:
+                # provider.dimensions would re-probe the network and raise.
+                logger.warning("Embedded no symbols with %s — provider unreachable?",
+                               provider.name)
+                return 0
+
+            # Remember what actually embedded, so the next flag-less run
+            # continues with it. Recorded only on success: a typo'd model must
+            # not become the index's choice, and a switch that failed part way
+            # through must not be reverted by the old model's row count.
+            self.db.remember_embedding_model(provider.name)
+
+            # Store embeddings
+            dims = provider.dimensions
+            for symbol_id, emb_bytes in results:
+                # Find body_hash from the symbols list
+                sym = next((s for s in symbols if s["id"] == symbol_id), None)
+                body_hash = sym["body_hash"] if sym else None
+                self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes, body_hash)
+
+            self.db.commit()
+        except Exception as e:
+            # exc_info: this catch also covers upsert/commit, so a programming
+            # error must not be reported as one line reading like an outage.
+            logger.error("Embedding failed, index left intact: %s", e, exc_info=True)
+            try:
+                self.db.rollback()
+            except Exception:
+                logger.debug("Rollback after embedding failure failed", exc_info=True)
             return 0
-
-        # Store embeddings
-        dims = provider.dimensions
-        for symbol_id, emb_bytes in results:
-            # Find body_hash from the symbols list
-            sym = next((s for s in symbols if s["id"] == symbol_id), None)
-            body_hash = sym["body_hash"] if sym else None
-            self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes, body_hash)
-
-        self.db.commit()
 
         # Build .npy sidecar for GPU-resident vector cache
         if results:

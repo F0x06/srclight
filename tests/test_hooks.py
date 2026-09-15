@@ -298,3 +298,44 @@ def test_hook_logs_missing_binary(tmp_path):
     assert r.returncode == 0
     log = (repo / ".srclight" / "reindex.log").read_text()
     assert STALE_BIN in log and "not executable" in log
+
+
+def test_hook_does_nothing_under_git_for_windows(tmp_path, tmp_path_factory):
+    """Git for Windows runs hooks in WSL clones under /mnt/c; they must not act there."""
+    import subprocess
+    repo = _git_repo(tmp_path / "repo")
+    (repo / ".srclight").mkdir()
+    marker = tmp_path / "ran"
+    fake_bin = tmp_path_factory.mktemp("bin") / "srclight"
+    fake_bin.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    fake_bin.chmod(0o755)
+    shim = tmp_path_factory.mktemp("shim")
+    (shim / "uname").write_text("#!/bin/sh\necho MINGW64_NT-10.0-26200\n")
+    (shim / "uname").chmod(0o755)
+    _install_hooks_in_repo(repo, str(fake_bin))
+    env = {**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"}
+    for name, args in (("post-commit", []), ("post-checkout", ["a", "b", "1"])):
+        r = subprocess.run(["sh", str(repo / ".git" / "hooks" / name), *args],
+                           cwd=repo, env=env, capture_output=True, text=True)
+        assert r.returncode == 0
+    assert not marker.exists()
+    assert not (repo / ".srclight" / "reindex.log").exists()
+
+
+def test_hook_still_runs_on_linux(tmp_path, tmp_path_factory):
+    """The Windows guard must not stop the hook on Linux."""
+    import subprocess
+    import time
+    repo = _git_repo(tmp_path / "repo")
+    marker = tmp_path / "ran"
+    fake_bin = tmp_path_factory.mktemp("bin") / "srclight"
+    fake_bin.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    fake_bin.chmod(0o755)
+    _install_hooks_in_repo(repo, str(fake_bin))
+    r = subprocess.run(["sh", str(repo / ".git" / "hooks" / "post-commit")],
+                       cwd=repo, capture_output=True, text=True)
+    assert r.returncode == 0
+    deadline = time.monotonic() + 10
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert marker.exists()

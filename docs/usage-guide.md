@@ -195,6 +195,7 @@ The `project` parameter filters to one repo. Omit it to search all.
 4. Changed files are re-parsed (tree-sitter), FTS5 indexes updated
 5. Embeddings are refreshed too, if this index has a recorded model (or `SRCLIGHT_EMBED_MODEL` reaches the hook and the index has recorded nothing)
 6. Output logged to `.srclight/reindex.log`
+7. Under Git for Windows (for example a WSL clone under `/mnt/c` committed from Windows) the hooks exit without doing anything, because the srclight binary they name is a Linux path
 
 **Note**: step 5 is why `--embed` is passed only once. An index that has never embedded stays keyword-only, and `--forget-embed-model` takes an index back to that state. If the embedding provider is unreachable when the hook fires, the run logs a warning and keeps the parse work: FTS5 search (`search_symbols`, keyword part of `hybrid_search`) is never held hostage to the embedding model.
 
@@ -232,7 +233,7 @@ Git hooks reindex in the background with a bare `srclight index .`, so they re-e
 ```bash
 # Add to crontab (crontab -e)
 # Nightly at 2:13am — reindex + embed all projects, then install hooks for any new repos
-13 2 * * * /path/to/srclight-venv/bin/srclight workspace index -w myworkspace --embed qwen3-embedding >> /tmp/srclight-embed-cron.log 2>&1 && /path/to/srclight-venv/bin/srclight hook install --workspace myworkspace >> /tmp/srclight-embed-cron.log 2>&1
+13 2 * * * date -Is >> ~/.local/state/srclight/cron.log; /path/to/srclight-venv/bin/srclight workspace index -w myworkspace --embed qwen3-embedding >> ~/.local/state/srclight/cron.log 2>&1; /path/to/srclight-venv/bin/srclight hook install --workspace myworkspace >> ~/.local/state/srclight/cron.log 2>&1; /path/to/srclight-venv/bin/srclight hook status --workspace myworkspace >> ~/.local/state/srclight/cron.log 2>&1
 ```
 
 **Why this is fast most nights:** Both indexing and embedding are incremental. Files are skipped if their git hash hasn't changed; symbols are skipped if their `body_hash` hasn't changed. A workspace with 40 projects and 170K symbols typically finishes in under a minute on nights with little activity.
@@ -240,12 +241,42 @@ Git hooks reindex in the background with a bare `srclight index .`, so they re-e
 **Prerequisites:**
 - The embedding provider (e.g. Ollama) must be running at cron time
 - Use the full path to the `srclight` binary (cron doesn't load your shell profile)
-- The `hook install` step is idempotent — it adds hooks to new repos and skips existing ones
+- The `hook install` step is safe to repeat — it adds hooks to new repos, repairs hooks whose binary has gone, and leaves working hooks alone
 
 **Checking the log:**
 ```bash
-tail -50 /tmp/srclight-embed-cron.log
+tail -50 ~/.local/state/srclight/cron.log
 ```
+
+Keep the log out of `/tmp`, which a reboot clears, and separate the commands with `;` rather than `&&`, so a failed index run still reinstalls hooks and still records `hook status`. Create the directory once with `mkdir -p ~/.local/state/srclight`.
+
+`hook install` repairs a hook whose binary no longer exists (for example after moving the checkout), and leaves a working hook alone unless you pass `--force`. `hook status` reports `STALE` for a hook whose binary is missing and for a `core.hooksPath` that points at a missing directory.
+
+#### Rotating the cron log
+
+The log grows every night. A user-level logrotate run keeps it bounded without root:
+
+```ini
+# ~/.config/logrotate/srclight.conf
+/home/you/.local/state/srclight/cron.log {
+    weekly
+    maxsize 20M
+    rotate 8
+    compress
+    delaycompress
+    dateext
+    missingok
+    notifempty
+}
+```
+
+```bash
+mkdir -p ~/.local/state/logrotate
+# Before the 02:13 job, with a user-owned state file:
+5 2 * * * /usr/sbin/logrotate --state /home/you/.local/state/logrotate/srclight.state /home/you/.config/logrotate/srclight.conf
+```
+
+Check the configuration with `logrotate -d --state ... ~/.config/logrotate/srclight.conf`. The cron job opens the log afresh on each run, so no `copytruncate` is needed.
 
 ### How Incremental Indexing Works
 

@@ -731,6 +731,9 @@ def _post_commit_snippet(srclight_path: str) -> str:
     """Hook snippet for post-commit: reindex after every commit."""
     return f"""{_HOOK_MARKER_START}
 # Auto-reindex after commit (installed by srclight hook install)
+# Git for Windows also runs these hooks (e.g. WSL clones under /mnt/c), but
+# the srclight binary is a Linux path, so do nothing there.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exit 0 ;; esac
 if [ -x "{srclight_path}" ]; then
     (
         cd "$(git rev-parse --show-toplevel)" && \\
@@ -758,6 +761,9 @@ def _post_checkout_snippet(srclight_path: str) -> str:
     return f"""{_HOOK_MARKER_START}
 # Auto-reindex on branch switch (installed by srclight hook install)
 # $1=prev_HEAD $2=new_HEAD $3=1 if branch checkout
+# Git for Windows also runs these hooks (e.g. WSL clones under /mnt/c), but
+# the srclight binary is a Linux path, so do nothing there.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exit 0 ;; esac
 if [ "$3" = "1" ] && [ "$1" != "$2" ] && [ -x "{srclight_path}" ]; then
     (
         cd "$(git rev-parse --show-toplevel)" && \\

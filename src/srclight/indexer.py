@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import bisect
 import fnmatch
+import functools
 import hashlib
 import json
 import logging
@@ -18,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
@@ -648,6 +649,613 @@ def _on_boundary(content: str, index: int) -> bool:
     return before != after
 
 
+# Names left out of the call graph. A short or everyday word is more often a
+# variable than a call, and a name defined in many places links each call to
+# all of them when nothing but the name resolves it.
+GRAPH_MIN_NAME_LEN = 4
+GRAPH_NOISE_NAMES = frozenset({
+    # Common short identifiers
+    "get", "set", "run", "new", "end", "add", "put", "pop", "top",
+    "map", "key", "val", "len", "str", "int", "err", "log", "max",
+    "min", "abs", "all", "any", "for", "not", "and", "the",
+    "def", "var", "let", "con", "ret", "gen", "ptr", "pos",
+    # Common C/C++ names
+    "init", "main", "next", "prev", "data", "size", "type", "name",
+    "node", "list", "info", "item", "test", "self", "this", "true",
+    "false", "none", "null", "void", "char", "bool", "auto",
+    "file", "path", "text", "line", "args", "argv", "argc",
+    "read", "open", "send", "recv", "copy", "move", "swap",
+    "push", "find", "sort", "hash", "lock", "call", "bind",
+    "from", "into", "with", "each", "then", "done", "fail",
+    "pass", "skip", "stop", "wait", "save", "load",
+    "value", "begin", "close", "clear", "reset", "write",
+    "check", "parse", "print", "state", "count", "index",
+    "start", "empty", "erase", "front", "apply",
+    # Common variable names that create cross-file noise
+    "result", "output", "input", "buffer", "config", "params",
+    "status", "error", "offset", "length", "width", "height",
+    "tensor", "image", "model", "layer", "batch", "channel",
+    # Catch2/test framework internals
+    "Clara", "Detail", "Catch", "Matchers",
+})
+GRAPH_MAX_FANOUT = 10
+
+
+def graph_name_excluded(name: str) -> bool:
+    """Whether calls to `name` are never put in the graph."""
+    return len(name) < GRAPH_MIN_NAME_LEN or name in GRAPH_NOISE_NAMES
+
+
+# Words that can precede a name in a statement without declaring it.
+_NOT_A_TYPE = frozenset({
+    "return", "else", "case", "goto", "throw", "delete", "new", "sizeof",
+    "co_return", "co_yield", "co_await", "class", "struct", "union", "enum",
+    "friend", "typename", "using", "namespace", "template", "public", "private",
+    "protected", "operator", "do", "if", "while", "for", "switch", "typedef",
+    "alignof", "decltype", "static_assert", "defined",
+})
+# A declaration starts a statement, a parameter or a `for` header — after one
+# of these, or after a word that only qualifies what follows.
+_DECL_OPENERS = frozenset(";{}(,)")
+_DECL_QUALIFIERS = frozenset({
+    "const", "volatile", "static", "extern", "register", "mutable", "constexpr",
+    "inline", "thread_local", "unsigned", "signed", "struct", "class", "union",
+    "enum", "typename",
+})
+# A declaration: `Type name`, `ns::Type<int>* name`, followed by `=`, `;`,
+# `,`, `[` or `{`. The type is group 1, with its namespace if written.
+_LOCAL_DECL_RE = re.compile(
+    r"(?<![\w.>:])((?:[A-Za-z_]\w*\s*::\s*)*[A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+"
+    r"([A-Za-z_]\w*)\s*(?=(?:=(?!=))|[;,\[{])")
+_WORD_BEFORE_RE = re.compile(r"([A-Za-z_]\w*)\s*$")
+_MACRO_PARAMS_RE = re.compile(r"#\s*define\s+\w+\(([^)]*)\)")
+# Words a parameter's type may hold that are no name of its own.
+_TYPE_WORDS = _DECL_QUALIFIERS | {"long", "short", "int", "char", "float", "double", "void",
+                                  "bool", "auto"}
+
+
+def _opens_a_declaration(content: str, at: int) -> bool:
+    while True:
+        start = max(0, at - 80)
+        before = content[start:at].rstrip()
+        if not before or before[-1] in _DECL_OPENERS:
+            return True
+        word = _WORD_BEFORE_RE.search(before)
+        if word is None or word.group(1) not in _DECL_QUALIFIERS:
+            return False
+        at = start + word.start()
+
+
+def _declares_a_class(content: str) -> bool:
+    """Whether a template symbol's text is a class template's body, rather
+    than a function template."""
+    m = re.match(r"\s*template\s*<", content)
+    if m is None:
+        return False
+    depth, i = 1, m.end()
+    while i < len(content) and depth:
+        depth += {"<": 1, ">": -1}.get(content[i], 0)
+        i += 1
+    return re.match(r"\s*(?:class|struct|union)\b[^;(]*\{", content[i:]) is not None
+
+
+def _parameter_name(param: str) -> str | None:
+    """The name a parameter declares, or None when it declares none —
+    `Vec_c`, `const Vec_c&`, `struct Node*` name only a type."""
+    param = param.split("=", 1)[0]
+    pointer = re.search(r"\(\s*[*&^]\s*(\w+)\s*\)", param)
+    if pointer:
+        return pointer.group(1)
+    param = re.sub(r"\[[^\]]*\]", "", param)
+    while True:
+        stripped = re.sub(r"<[^<>]*>", " ", param)
+        if stripped == param:
+            break
+        param = stripped
+    param = re.sub(r"[A-Za-z_]\w*\s*::\s*", "", param)  # `ns::Type` is one type
+    words = re.findall(r"[A-Za-z_]\w*", param)
+    if len(words) < 2 or words[-1] in _TYPE_WORDS:
+        return None
+    if all(w in _DECL_QUALIFIERS - {"unsigned", "signed"} for w in words[:-1]):
+        return None  # `const Vec_c`, `struct Node`: a type after its qualifiers
+    return words[-1]
+
+
+def _parameter_names(content: str, name: str, kind: str) -> set[str]:
+    """The parameter names of a C/C++ function or function-like macro, read
+    from its text: the first parenthesised list after its own name."""
+    if kind == "macro":
+        m = _MACRO_PARAMS_RE.search(content)
+        return {p.strip() for p in m.group(1).split(",") if p.strip().isidentifier()} if m else set()
+    short = name.rsplit("::", 1)[-1]
+    m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
+    if m is None:
+        return set()
+    depth, i = 1, m.end()
+    while i < len(content) and depth:
+        depth += {"(": 1, ")": -1}.get(content[i], 0)
+        i += 1
+    found: set[str] = set()
+    depth, part = 0, []
+    # `<` and `>` are no brackets here: in a default argument they compare.
+    for ch in content[m.end():i - 1] + ",":
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            declared = _parameter_name("".join(part))
+            if declared:
+                found.add(declared)
+            part = []
+        else:
+            part.append(ch)
+    return found
+
+
+_INNER_PARAM_RE = re.compile(
+    r"[(,]\s*(?:const\s+)?([A-Za-z_]\w*)(?:\s*<[^;{}()<>]*>)?[\s*&]+([A-Za-z_]\w*)\s*(?=[,):])")
+
+
+# A qualified name as written, `A::B::f`, and the `(` of its call if any.
+_QUALIFIED_CALL_RE = re.compile(
+    r"(?<![\w:])([A-Za-z_]\w*(?:::~?[A-Za-z_]\w*)+)(?![\w:])\s*(\()?")
+
+
+def _type_of_declaration(text: str, declared: str) -> str | None:
+    """The class a declaration `const ns::Type<int>* name` gives `name`."""
+    text = text.split("=", 1)[0]
+    while True:
+        stripped = re.sub(r"<[^<>]*>", " ", text)
+        if stripped == text:
+            break
+        text = stripped
+    text = re.sub(r"[A-Za-z_]\w*\s*::\s*", "", text)
+    words = re.findall(r"[A-Za-z_]\w*", text)
+    if len(words) < 2 or words[-1] != declared:
+        return None
+    kind = words[-2]
+    return None if kind in _TYPE_WORDS else kind
+
+
+def _declared_types(content: str, name: str, kind: str) -> dict[str, str]:
+    """The class each variable a C/C++ symbol declares is of — its
+    parameters and its locals — where the declaration writes it."""
+    types: dict[str, str] = {}
+    if kind not in ("class", "struct", "union", "enum", "macro"):
+        short = name.rsplit("::", 1)[-1]
+        m = re.search(rf"(?<![\w$]){re.escape(short)}\s*\(", content)
+        if m is not None:
+            depth, i = 1, m.end()
+            while i < len(content) and depth:
+                depth += {"(": 1, ")": -1}.get(content[i], 0)
+                i += 1
+            depth, part = 0, []
+            for ch in content[m.end():i - 1] + ",":
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    declared = _parameter_name("".join(part))
+                    if declared:
+                        found = _type_of_declaration("".join(part), declared)
+                        if found:
+                            types[declared] = found
+                    part = []
+                else:
+                    part.append(ch)
+    declared: list[tuple[str, str]] = [
+        (m.group(2), m.group(1).rsplit("::", 1)[-1].strip())
+        for m in _LOCAL_DECL_RE.finditer(content)
+        if m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+        and _opens_a_declaration(content, m.start())]
+    # A lambda's or a range-for's parameters: `[](Mat* x)`, `for (Mat* x : v)`.
+    declared += [(m.group(2), m.group(1)) for m in _INNER_PARAM_RE.finditer(content)
+                 if m.group(1) not in _NOT_A_TYPE and m.group(1) not in _TYPE_WORDS]
+    # Blocks are not tracked: a name declared twice with two types may mean
+    # either one at a given call, so it has no known type.
+    for var, kind_ in declared:
+        if kind_ in _TYPE_WORDS:
+            kind_ = None
+        if var in types and types[var] != kind_:
+            types[var] = None
+        else:
+            types.setdefault(var, kind_)
+    return {var: kind_ for var, kind_ in types.items() if kind_}
+
+
+def _declared_names(content: str, name: str, kind: str) -> set[str]:
+    """Names a C/C++ symbol declares for itself — its parameters, its locals,
+    a class's fields. Inside the symbol they name that variable, not the
+    function of the same name elsewhere: `int blendColor` is no call to
+    `blendColor()`."""
+    names = set() if kind in ("class", "struct", "union", "enum") else _parameter_names(
+        content, name, kind)
+    for m in _LOCAL_DECL_RE.finditer(content):
+        if (m.group(1) not in _NOT_A_TYPE and m.group(2) not in _NOT_A_TYPE
+                and _opens_a_declaration(content, m.start())):
+            names.add(m.group(2))
+    return names
+
+
+_QUALIFIER_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:<[^;{}]*>)?\s*::\s*$")
+_THIS_ARROW_RE = re.compile(r"(?<![\w$])this\s*->$")
+# Unicode letters too, as the name matcher reads them: `Ölstand_lesen`.
+_IDENT_RE = re.compile(r"(?:[^\W\d]|\$)[\w$]*")
+
+
+_TEMPLATE_ARGS_RE = re.compile(r"<[^<>(){};|&]*(?:<[^<>(){};|&]*>[^<>(){};|&]*)*>")
+# Literals and comments, read left to right: `"http://x"` is a string, and
+# `// "a,b"` a comment.
+_SIGNATURE_NOISE_RE = re.compile(
+    r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n]){1,4}\'|//[^\n]*|/\*[\s\S]*?\*/')
+
+
+def _literals_as_values(original: str, masked: str) -> str:
+    """Put back a value where masking blanked a string or character literal.
+
+    Blanked, `f("x")` reads as a call with no argument. The literal's span
+    is filled with `0`, which names nothing and is no bracket or comma. A
+    span masking did not blank entirely is left alone: a quote in code, or
+    across a comment's edge, is no literal to restore. Comments are read in
+    the same pass, so a literal inside one, `f(/* "x" */)`, stays blank.
+    """
+    out = None
+    for m in _SIGNATURE_NOISE_RE.finditer(original):
+        if m.group(0).startswith("/"):
+            continue
+        if masked[m.start():m.end()].isspace():
+            if out is None:
+                out = list(masked)
+            out[m.start():m.end()] = "0" * (m.end() - m.start())
+    return masked if out is None else "".join(out)
+
+
+def _call_arity(content: str, paren: int) -> int:
+    """How many arguments the call whose `(` sits at `paren` passes.
+
+    `pair<int, int>(1, 2)` is one argument: a `<` right after a name opens
+    template arguments when a matching `>` follows with nothing that only
+    an expression holds in between.
+    """
+    depth, commas, i, empty = 0, 0, paren, True
+    while i < len(content):
+        ch = content[i]
+        if ch == "<" and depth >= 1 and i and (content[i - 1].isalnum() or content[i - 1] == "_"):
+            template = _TEMPLATE_ARGS_RE.match(content, i)
+            if template:
+                empty = False
+                i = template.end()
+                continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif ch == "," and depth == 1:
+            commas += 1
+        elif depth >= 1 and not ch.isspace():
+            empty = False
+        i += 1
+    return 0 if empty else commas + 1
+
+
+def _without_template_commas(params: str) -> str:
+    """Hide the commas of template argument lists, `map<int, int> m` being
+    one parameter. A `<` opens one only right after a name, closed by a `>`
+    with nothing between that only an expression holds, `=` included: in a
+    default argument, `x < 3, int c` and `1 << 3` compare and shift."""
+    out = None
+    for m in re.finditer(r"(?<=[A-Za-z_\d:])\s*<(?!<)", params):
+        at = m.end() - 1
+        before = params[:m.start()]
+        if at and params[at - 1] == "<" or not re.search(r"[A-Za-z_][\w:]*$", before):
+            continue
+        args = _TEMPLATE_ARGS_RE.match(params, at)
+        if args is None or "=" in args.group(0):
+            continue
+        out = out or list(params)
+        for k in range(args.start(), args.end()):
+            if out[k] == ",":
+                out[k] = ";"
+    return params if out is None else "".join(out)
+
+
+@functools.lru_cache(maxsize=65536)
+def _param_range(signature: str | None, name: str) -> tuple[int, float] | None:
+    """How many arguments a function's signature accepts, defaults and `...`
+    counted — or None when the signature cannot say."""
+    if not signature:
+        return None
+    # A comma in a comment or a default string, `s = "a,b"`, parts nothing.
+    signature = _SIGNATURE_NOISE_RE.sub(
+        lambda m: " " if m.group(0).startswith("/") else "0", signature)
+    m = re.search(rf"(?<![\w$]){re.escape(name)}\s*\(", signature)
+    if m is None:
+        return None
+    depth, i = 1, m.end()
+    while i < len(signature) and depth:
+        depth += {"(": 1, ")": -1}.get(signature[i], 0)
+        i += 1
+    params = signature[m.end():i - 1].strip()
+    if params in ("", "void"):
+        return (0, 0)
+    params = _without_template_commas(params)
+    parts, depth, part = [], 0, []
+    for ch in params + ",":
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(part).strip())
+            part = []
+        else:
+            part.append(ch)
+    if any("..." in part for part in parts):
+        return (sum(1 for part in parts if "=" not in part and "..." not in part), float("inf"))
+    required = sum(1 for part in parts if "=" not in part)
+    return (required, len(parts))
+
+
+def _accepts(t: dict, name: str, arities: set[int]) -> bool:
+    """Whether a target takes one of the argument counts seen. Every
+    signature of the function counts: default arguments are often written
+    in the header prototype only, not in the definition."""
+    if t["kind"] not in ("function", "method", "template", "prototype"):
+        return True
+    short = name.rsplit("::", 1)[-1]
+
+    def accepted_by(signature: str | None) -> tuple[int, float] | None:
+        found = _param_range(signature, name)
+        return found if found is not None or short == name else _param_range(signature, short)
+
+    own = accepted_by(t.get("signature"))
+    if own is None:
+        return True
+    lowest, highest = own
+    # A prototype with as many parameters is this function's own
+    # declaration — other counts are other overloads — and its defaults
+    # lower the count a call may pass.
+    for signature in t.get("other_signatures", ()):
+        declared = accepted_by(signature)
+        if declared is not None and declared[1] == highest:
+            lowest = min(lowest, declared[0])
+    return any(lowest <= a <= highest for a in arities)
+
+
+def _reference_forms_all(content: str, names: set[str],
+                         arities: dict[str, set] | None = None,
+                         receivers: dict[str, set] | None = None,
+                         ) -> dict[str, tuple[set[str], set[str]]]:
+    """For each of `names`, how a C/C++ symbol's text refers to it: `member`
+    (`x.name(`, `p->name(`), `this` (`this->name(`), `qualified` (`X::name`,
+    with each `X`), `global` (`::name`) or `bare` — or as no function at all:
+    `field` (`x.name` with no call) and `object` (`name.x`, `name->x`). One
+    pass over the text."""
+    found: dict[str, tuple[set[str], set[str]]] = {}
+    for m in _IDENT_RE.finditer(content):
+        name = m.group(0)
+        if name not in names:
+            continue
+        forms, qualifiers = found.setdefault(name, (set(), set()))
+        before = content[max(0, m.start() - 200):m.start()].rstrip()
+        ahead = content[m.end():m.end() + 200]
+        after = ahead.lstrip()[:3]
+        if arities is not None:
+            # The argument count of each call; None where the name is not
+            # called there (a function pointer, a declaration).
+            declared = _CONSTRUCTED_VAR_RE.match(ahead)
+            if after.startswith("(") or (
+                    # `T{1, 2}` constructs a T; `class T {` and a base,
+                    # `public T {`, open a body.
+                    after.startswith("{") and not before.endswith(("->", ".", "::"))
+                    and not _OPENS_A_BODY_RE.search(before)):
+                arities.setdefault(name, set()).add(
+                    _call_arity(content, m.end() + len(ahead) - len(ahead.lstrip())))
+            elif declared and declared.group(1) not in _NOT_A_TYPE and not before.endswith(
+                    ("->", ".", "::")):
+                # `T x(args)` and `T x{args}` construct a T.
+                arities.setdefault(name, set()).add(_call_arity(content, m.end() + declared.end() - 1))
+            elif (after[:1] in (",", ")", ";", "}", "]")
+                  or (after.startswith("=") and not after.startswith("=="))
+                  or before.endswith(("&", "=", "return"))):
+                # Used as a value — a function pointer names every overload.
+                # Used as a type (`Angle a(1)`, `Angle* p`) it says nothing.
+                arities.setdefault(name, set()).add(None)
+        member_access = before.endswith(("->", ".")) and not before.endswith("..")
+        # `x.get<int>()` calls; `x.count < 0` compares a field.
+        template_call = False
+        if after.startswith("<"):
+            args = _TEMPLATE_ARGS_RE.match(content, m.end() + len(ahead) - len(ahead.lstrip()))
+            template_call = args is not None and content[
+                args.end():args.end() + 80].lstrip().startswith("(")
+        # `(*o->fn)(1)` and `CALL(o->fn)` call what the parenthesis closes on.
+        if member_access and not (after.startswith(("(", ")")) or template_call):
+            forms.add("field")  # `x.flags & mask`: a member read, no call
+        elif after.startswith(("->", ".")) and not after.startswith("..."):
+            forms.add("object")  # `current.pos`: a value, whatever else it names
+        elif _THIS_ARROW_RE.search(before):
+            forms.add("this")
+        elif member_access:
+            forms.add("member")
+            if receivers is not None:
+                # The variable the member is called on, when it is one:
+                # `lamp->f()`, not `a.b->f()` nor `get()->f()`.
+                lead = before[:-2] if before.endswith("->") else before[:-1]
+                lead = lead.rstrip()
+                var = re.search(r"([A-Za-z_]\w*)$", lead)
+                simple = var is not None and not lead[:var.start()].rstrip().endswith(
+                    (".", "->", "::", ")", "]"))
+                receivers.setdefault(name, set()).add(var.group(1) if simple else None)
+        elif before.endswith("::"):
+            q = _QUALIFIER_RE.search(before)
+            if q is None or q.group(1) in _NOT_A_TYPE:  # `return ::name()`
+                forms.add("global")
+            else:
+                forms.add("qualified")
+                qualifiers.add(q.group(1))
+        else:
+            forms.add("bare")
+    return found
+
+
+# Before a name followed by `{` that opens a body rather than constructing.
+_OPENS_A_BODY_RE = re.compile(
+    r"(?<![\w$])(?:class|struct|union|enum|namespace|public|private|protected|virtual|final)$")
+
+# After a type's name: a variable constructed with arguments, `a(1, 2)` or `a{1}`.
+_CONSTRUCTED_VAR_RE = re.compile(r"\s+([A-Za-z_]\w*)\s*[({]")
+
+
+def _reference_forms(content: str, name: str) -> tuple[set[str], set[str]]:
+    """`_reference_forms_all` for a single name."""
+    return _reference_forms_all(content, {name}).get(name, (set(), set()))
+
+
+_MEMBER_KINDS = frozenset({"method", "template"})
+
+
+def _without_template_args(qualified: str) -> str:
+    while True:
+        stripped = re.sub(r"<[^<>]*>", "", qualified)
+        if stripped == qualified:
+            return qualified
+        qualified = stripped
+
+
+def _is_constructor(t: dict, name: str) -> bool:
+    """Whether a target is a constructor of the class `name` (qualified or
+    not). A class named like its namespace, `Gadget::Gadget`, is none."""
+    if t.get("kind") not in ("method", "prototype", "function", "template"):
+        return False
+    short = name.rsplit("::", 1)[-1]
+    own = f"{short}::{short}"
+    qualified = _without_template_args(t.get("qualified") or "")
+    # Whole names: `MyBox::Box` is a method, not a constructor of `Box`.
+    return qualified == own or qualified.endswith("::" + own)
+
+
+def _narrow_python_self_call(targets: list[dict], name: str, content: str,
+                             qualified: str, kind: str) -> tuple[list[dict], str | None]:
+    """In a Python method, `self.name()` and `cls.name()` reach a method:
+    the class's own when it has one, and never a module-level function.
+
+    Only when every use of the name in the body goes through `self` or
+    `cls`; a bare `name()` beside it may be the function.
+    """
+    if kind not in ("function", "method") or "." not in qualified:
+        return targets, None
+    uses = []
+    for m in re.finditer(rf"(?<!\w){re.escape(name)}\b", content):
+        receiver = re.search(r"(\w+)\s*\.\s*$", content[max(0, m.start() - 60):m.start()])
+        uses.append(receiver.group(1) if receiver else None)
+    if not uses or any(u not in ("self", "cls") for u in uses):
+        return targets, None
+    scope = qualified.rsplit(".", 1)[0]
+    own = [t for t in targets if t.get("qualified") == f"{scope}.{name}"]
+    if own:
+        return own, "same_class"
+    methods = [t for t in targets if "." in (t.get("qualified") or "")]
+    return (methods, None) if methods else (targets, None)
+
+
+def _narrow_by_syntax(targets: list[dict], name: str, forms: set[str],
+                      qualifiers: set[str], source_scope: str | None,
+                      source_kind: str, source_in_c: bool = False,
+                      arities: set | None = None,
+                      receiver_types: set | None = None,
+                      ) -> tuple[list[dict], str | None]:
+    """Keep the C/C++ targets the way a name is written can reach.
+
+    `X::name` reaches the `name` of an `X` (or `X`'s constructor); a method's
+    bare or `this->` call reaches its own class's method when there is one.
+    Otherwise the syntax only ranks: a member access (`p->name()`) prefers
+    methods to free functions, a free function's bare or `::` call prefers
+    anything but methods — prefers, because the extractor's kinds are not
+    certain, and C calls through pointer fields named like functions.
+    Returns the targets left, and the resolution when the syntax alone
+    decided it.
+    """
+    values = forms & {"field", "object"}
+    forms = forms - values
+    if values and not forms:
+        return [], None  # only ever a value, never called or named as a function
+    # A call passing two arguments reaches no `f(int)`. Only when every use
+    # is a call: a function pointer names every overload.
+    if arities and None not in arities:
+        fitting = [t for t in targets if _accepts(t, name, arities)]
+        if fitting:
+            targets = fitting
+    if "::" in name or not forms:
+        return targets, None  # the reference is qualified already: `C::f`
+
+    def qualified(t: dict) -> str:
+        return t.get("qualified") or name
+
+    # `lamp->f()` with `Lamp_c* lamp` declared in the symbol reaches `Lamp_c::f`.
+    if forms == {"member"} and receiver_types and None not in receiver_types:
+        typed = [t for t in targets if t["kind"] in _MEMBER_KINDS and any(
+            _without_template_args(qualified(t)) == f"{c}::{name}"
+            or _without_template_args(qualified(t)).endswith(f"::{c}::{name}")
+            for c in receiver_types)]
+        if typed:
+            return typed, "typed"
+
+    def is_named(t: dict, full: str) -> bool:
+        q = qualified(t)
+        return q == full or q.endswith("::" + full)
+
+    own_class = source_scope and source_scope.rsplit("::", 1)[-1] != name
+    if own_class and forms <= {"bare", "this"}:
+        # The class or function of that name in the own scope — and a
+        # class's constructor with it.
+        own = [t for t in targets
+               if _without_template_args(qualified(t)) in (
+                   f"{source_scope}::{name}", f"{source_scope}::{name}::{name}")]
+        if own:
+            return own, "same_class"
+    if forms == {"qualified"}:
+        named = [t for t in targets if any(
+            is_named(t, f"{q}::{name}") or is_named(t, f"{q}::{name}::{name}")
+            for q in qualifiers)]
+        if named:
+            return named, "qualified" if len(named) == 1 else None
+    preferred = targets
+    if forms <= {"member", "this"} and not source_in_c:
+        # C has no methods: a member call there goes through a pointer field,
+        # and nothing ranks one function above another. A function in a `.c` file is never a method. One in C++ — or in a
+        # header, which is C or C++ — may be: an inline method in a class
+        # body the parser could not follow is stored as one.
+        preferred = [t for t in targets
+                     if t["kind"] in _MEMBER_KINDS
+                     or (t["kind"] == "function" and not t["file"].endswith(".c"))]
+    elif forms == {"global"} or (
+            source_kind == "function" and not source_scope and forms <= {"bare", "global"}):
+        # A template may be a free function template; only a method is out.
+        preferred = [t for t in targets
+                     if t["kind"] != "method" or _is_constructor(t, name)]
+        if forms == {"global"}:
+            # `::name` is the global one, not a namespace's.
+            preferred = [t for t in preferred if "::" not in qualified(t)] or preferred
+    pool = preferred or targets
+    if forms == {"member"}:
+        # `x.f()` with the type of `x` unknown: when several classes have an
+        # `f`, neither the file nor the directory says which one.
+        classes = {qualified(t).rsplit("::", 1)[0] for t in pool
+                   if t["kind"] in _MEMBER_KINDS and "::" in qualified(t)}
+        if len(classes) > 1:
+            return pool, "name_only"
+    return pool, None
+
+
+# Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
+_EDGE_TARGET_KINDS = frozenset({
+    "function", "method", "class", "struct", "enum", "interface", "template"})
+
+
 def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
     """Return a function mapping a symbol body to the known names it references.
 
@@ -754,6 +1362,36 @@ def build_name_matcher(names: set[str]) -> Callable[[str], set[str]]:
         return found
 
     return match
+
+
+# The only symbols whose whole body is scanned for references. A function
+# does call what a function nested in it calls; anything else — a class, a
+# trait, a template, a namespace, in whatever language names them — only
+# holds its members, which are scanned as symbols of their own.
+_CALLABLE_KINDS = frozenset({"function", "method"})
+
+
+def _text_end(row) -> int:
+    """The last line a symbol's text spans. A `#define` node takes its
+    trailing newline, so its recorded end is the line after it."""
+    lines = len((row["content"] or "").rstrip("\r\n").split("\n"))
+    return min(row["end_line"], row["start_line"] + lines - 1)
+
+
+def _own_text(content: str, start_line: int, end_line: int,
+              spans: Iterable[tuple[int, int]]) -> str:
+    """Blank the lines of `content` that symbols nested in it occupy.
+
+    `content` starts on `start_line`, so its line i is file line
+    start_line + i. A span identical to the symbol's own is not nested in
+    it: a template and the class it wraps cover the same lines.
+    """
+    lines = content.split("\n")
+    for start, end in spans:
+        if start_line <= start and end <= end_line and (start, end) != (start_line, end_line):
+            for i in range(max(0, start - start_line), min(len(lines), end - start_line + 1)):
+                lines[i] = ""
+    return "\n".join(lines)
 
 
 # Languages whose parse can break on a conditional that splits a brace across
@@ -2349,7 +2987,11 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.kind, s.metadata, f.path as file_path
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.signature, s.metadata,
+                      f.path as file_path,
+                      (f.language IN ('c', 'cpp') AND s.kind IN ('class', 'struct', 'union'))
+                       AS c_class,
+                      instr(s.content, '{{') = 0 AS bodiless
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -2359,55 +3001,86 @@ class Indexer:
         symbol_info: dict[int, dict] = {}
         for row in rows:
             name = row["name"]
-            info = {"id": row["id"], "file": row["file_path"], "kind": row["kind"],
-                    "body": _shared_body(row["metadata"])}
+            info = {"id": row["id"], "file": row["file_path"].replace("\\", "/"),
+                    "kind": row["kind"], "qualified": row["qualified_name"],
+                    "signature": row["signature"], "body": _shared_body(row["metadata"]),
+                    # `class Heap;`: a forward declaration, or a definition.
+                    "forward": bool(row["c_class"] and row["bodiless"]),
+                    "c_class_body": bool(row["c_class"] and not row["bodiless"])}
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
             name_to_symbols[name].append(info)
 
-        # Filter out short/common names that would create noise
-        MIN_NAME_LEN = 4
-        NOISE_NAMES = {
-            # Common short identifiers
-            "get", "set", "run", "new", "end", "add", "put", "pop", "top",
-            "map", "key", "val", "len", "str", "int", "err", "log", "max",
-            "min", "abs", "all", "any", "for", "not", "and", "the",
-            "def", "var", "let", "con", "ret", "gen", "ptr", "pos",
-            # Common C/C++ names
-            "init", "main", "next", "prev", "data", "size", "type", "name",
-            "node", "list", "info", "item", "test", "self", "this", "true",
-            "false", "none", "null", "void", "char", "bool", "auto",
-            "file", "path", "text", "line", "args", "argv", "argc",
-            "read", "open", "send", "recv", "copy", "move", "swap",
-            "push", "find", "sort", "hash", "lock", "call", "bind",
-            "from", "into", "with", "each", "then", "done", "fail",
-            "pass", "skip", "stop", "wait", "save", "load",
-            "value", "begin", "close", "clear", "reset", "write",
-            "check", "parse", "print", "state", "count", "index",
-            "start", "empty", "erase", "front", "apply",
-            # Common variable names that create cross-file noise
-            "result", "output", "input", "buffer", "config", "params",
-            "status", "error", "offset", "length", "width", "height",
-            "tensor", "image", "model", "layer", "batch", "channel",
-            # Catch2/test framework internals
-            "Clara", "Detail", "Catch", "Matchers",
-        }
-
-        # Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
-        EDGE_TARGET_KINDS = {"function", "method", "class", "struct", "enum", "interface", "template"}
-
         filtered_names = {
             name: syms for name, syms in name_to_symbols.items()
-            if len(name) >= MIN_NAME_LEN and name not in NOISE_NAMES
+            if not graph_name_excluded(name)
         }
 
-        # Skip names with too many symbols (ambiguous)
-        MAX_SYMBOL_FANOUT = 10
-        filtered_names = {
-            name: syms for name, syms in filtered_names.items()
-            if len(syms) <= MAX_SYMBOL_FANOUT
-        }
+        def _without_forward_declarations(targets: list[dict], source_file: str) -> list[dict]:
+            """A forward declaration, `class Heap;`, names a class defined
+            elsewhere: beside that definition among the candidates it is no
+            target of its own — a class declared ahead in many headers would
+            look ambiguous. Declared in the calling file, it tells which
+            class the file means: the candidates narrow to that class and
+            its members."""
+            defined = {t["qualified"] for t in targets if t["c_class_body"]}
+            meant = {t["qualified"] for t in targets
+                     if t["forward"] and t["qualified"] in defined and t["file"] == source_file}
+            kept = [t for t in targets if not (t["forward"] and t["qualified"] in defined)]
+            if len(meant) == 1:
+                (qualified,) = meant
+                kept = [t for t in kept if (t["c_class_body"] and t["qualified"] == qualified)
+                        or (t["qualified"] or "").startswith(qualified + "::")]
+            return kept
+        # A prototype is no target, but its signature is the function's too:
+        # default arguments are often written there only.
+        prototype_signatures: dict[str, list[str]] = {}
+        for syms in name_to_symbols.values():
+            for sym in syms:
+                if sym["kind"] == "prototype" and sym.get("signature"):
+                    prototype_signatures.setdefault(
+                        sym.get("qualified") or "", []).append(sym["signature"])
+        for syms in name_to_symbols.values():
+            for sym in syms:
+                if sym["kind"] in ("function", "method") and sym.get("qualified") in prototype_signatures:
+                    sym["other_signatures"] = prototype_signatures[sym["qualified"]]
+        # A member written with its class, `Stack_c::get()`, names one
+        # member — even when the name alone is too common to follow. A member
+        # defined or declared in its class has no symbol named that way, so it
+        # is listed under it; otherwise the text would read as the class
+        # `Stack_c` and a separate `get`.
+        # A function-like macro written after a declarator, `f() MACRO(x) {`,
+        # can be read as the function's name: that "function" is the macro.
+        macro_names = {name for name, syms in name_to_symbols.items()
+                       if any(s["kind"] == "macro" for s in syms)}
+
+        def _macro_misread(t: dict) -> bool:
+            # A constructor opens with its class's name, `Box(int)`: a macro
+            # of that name makes it no misread.
+            return (t["kind"] in ("function", "method", "prototype")
+                    and not _is_constructor(t, t.get("qualified", "").rsplit("::", 1)[-1])
+                    and t.get("qualified", "").rsplit("::", 1)[-1] in macro_names
+                    and (t.get("signature") or "").lstrip().startswith(
+                        t.get("qualified", "").rsplit("::", 1)[-1] + "("))
+
+        member_aliases: set[str] = set()
+        for name, syms in name_to_symbols.items():
+            for sym in syms:
+                if sym["kind"] not in _EDGE_TARGET_KINDS and not _is_constructor(sym, name):
+                    continue
+                parts = _without_template_args(sym.get("qualified") or "").split("::")
+                if len(parts) >= 2 and parts[-1] == name:
+                    aliases = ["::".join(parts[-2:])]
+                    # `ns::Tint(1, 2)` constructs: the constructor goes with
+                    # the class it is written as.
+                    if len(parts) >= 3 and _is_constructor(sym, name):
+                        aliases.append("::".join(parts[-3:-1]))
+                    for alias in aliases:
+                        member_aliases.add(alias)
+                        listed = filtered_names.setdefault(alias, [])
+                        if all(s["id"] != sym["id"] for s in listed):
+                            listed.append(sym)
 
         if not filtered_names:
             return 0
@@ -2440,17 +3113,41 @@ class Indexer:
                 return 0.7
             return 0.5
 
-        # Scan each symbol's content for references
+        # Scan each symbol's content for references. Every reference is kept:
+        # a per-symbol cap once dropped calls from long functions, in whatever
+        # order the name set happened to iterate, so two runs disagreed.
         edge_count = 0
-        MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.content, s.metadata, f.path as file_path, f.language
+            f"""SELECT s.id, s.name, s.qualified_name, s.kind, s.content, s.metadata,
+                      s.file_id, s.start_line, s.end_line, f.path as file_path, f.language
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
         ).fetchall()
+
+        # A container's body overlaps its members' bodies. Scanned whole, it
+        # re-reports every call they make and "calls" each method it declares:
+        # a class of a few thousand lines yields thousands of edges, nearly all
+        # noise. The members are scanned on their own, so anything that is not
+        # a callable keeps only the lines it owns — its bases, its fields'
+        # types. Spans are sorted by first line, so the ones a symbol may hold
+        # are found by bisection rather than by walking the whole file.
+        spans_by_file: dict[int, list[tuple[int, int]]] = {}
+        for row in content_rows:
+            spans_by_file.setdefault(row["file_id"], []).append(
+                (row["start_line"], _text_end(row))
+            )
+        for spans in spans_by_file.values():
+            spans.sort()
+        span_starts = {fid: [s for s, _ in spans] for fid, spans in spans_by_file.items()}
+
+        def _nested_spans(file_id: int, start_line: int, end_line: int) -> list[tuple[int, int]]:
+            spans = spans_by_file.get(file_id, [])
+            starts = span_starts.get(file_id, [])
+            return spans[bisect.bisect_left(starts, start_line):
+                         bisect.bisect_right(starts, end_line)]
 
         from .imports import extract_imports
         from .refmask import mask_noncode
@@ -2507,30 +3204,131 @@ class Indexer:
                 on_progress("call graph", done, len(content_rows))
             source_id = row["id"]
             source_name = row["name"]
-            source_file = row["file_path"]
+            source_file = row["file_path"].replace("\\", "/")
             # Mask comments/strings BEFORE scanning: a name that appears only in
             # prose is not a reference (12.8% of sampled edges were this class).
             content = mask_noncode(row["content"], row["language"] or "")
+            if row["language"] in ("c", "cpp"):
+                # A literal is still an argument: `f("x")` passes one.
+                content = _literals_as_values(row["content"], content)
+            if row["kind"] not in _CALLABLE_KINDS:
+                content = _own_text(
+                    content, row["start_line"], _text_end(row),
+                    _nested_spans(row["file_id"], row["start_line"], _text_end(row)),
+                )
 
             referenced_names = match_names(content)
             referenced_names.discard(source_name)
+            # `A::B::c()` read as the member `B::c` still names the class `B`.
+            for qualified_ref in [n for n in referenced_names if n in member_aliases]:
+                qualifier = qualified_ref.rsplit("::", 1)[0].rsplit("::", 1)[-1]
+                if qualifier in filtered_names and qualifier != source_name:
+                    referenced_names.add(qualifier)
 
-            imported = _imports_for(source_file, row["language"])
+            imported = _imports_for(row["file_path"], row["language"])
             # Names the #if/#else recovery put over one shared body each hold
             # the other's name; the extractor marked them, and between them
             # that is not a call.
             body = _shared_body(row["metadata"])
-            refs_for_this = 0
+            # In C and C++ the way a name is written narrows what it reaches,
+            # and a name the symbol declares for itself is no reference.
+            c_family = row["language"] in ("c", "cpp")
+            arities_of: dict[str, set] = {}
+            source_scope = None
+            if c_family:
+                unqualified = _without_template_args(row["qualified_name"] or "")
+                # A class template's body is its own scope. A constructor
+                # defined in its class is stored as a function, `C::C`; its
+                # scope is still its class.
+                if row["kind"] == "template" and _declares_a_class(content):
+                    source_scope = unqualified or None
+                elif row["kind"] in ("method", "template", "function") and "::" in unqualified:
+                    source_scope = unqualified.rsplit("::", 1)[0]
+                # An out-of-line definition opens with its own name, `C::f`:
+                # that is no call to the declaration `f`.
+                # A definition opens with its own name — `C::f`, or `f` and
+                # `~C` inside a class — which is no call. It is overwritten
+                # with a character no name holds: blanked, the return type
+                # before it, `C C::f(`, would read as `C(`; as an identifier,
+                # as a variable `C x(` constructed.
+                own_blanked = content
+                short_own = source_name.rsplit("::", 1)[-1]
+                for own in dict.fromkeys((source_name, short_own)):
+                    found = re.search(rf"(?<![\w:]){re.escape(own)}(?![\w])", own_blanked)
+                    if found:
+                        own_blanked = (own_blanked[:found.start()] + "#" * len(own)
+                                       + own_blanked[found.end():])
+                        break
+                receivers_of: dict[str, set] = {}
+                forms_of = _reference_forms_all(
+                    own_blanked, {n for n in referenced_names if "::" not in n},
+                    arities_of, receivers_of)
+                # A name met only inside the definition's own name — the class
+                # in `~C()` — is no reference.
+                referenced_names -= {n for n in referenced_names
+                                     if n.isidentifier() and n not in forms_of}
+                var_types = _declared_types(content, source_name, row["kind"])
+                # A qualified name, `C::f(...)`, is one token to the matcher:
+                # its argument counts are read here.
+                wanted = {n for n in referenced_names if "::" in n}
+                if wanted:
+                    for m in _QUALIFIED_CALL_RE.finditer(own_blanked):
+                        # The matcher may know the name by its last parts
+                        # only: `app::gfx::Tinter(1)` is a call to `gfx::Tinter`.
+                        parts = m.group(1).split("::")
+                        for k in range(len(parts) - 1):
+                            written = "::".join(parts[k:])
+                            if written in wanted:
+                                arities_of.setdefault(written, set()).add(
+                                    _call_arity(own_blanked, m.start(2)) if m.group(2) else None)
+                # A parameter or local hides the name written bare only:
+                # `x.name()`, `::name()` and `C::name()` still call.
+                for declared in _declared_names(content, source_name, row["kind"]):
+                    if declared not in referenced_names:
+                        continue
+                    forms, qualifiers = forms_of.get(declared, (set(), set()))
+                    if forms <= {"bare"}:
+                        referenced_names.discard(declared)
+                    else:
+                        forms_of[declared] = (forms - {"bare"}, qualifiers)
             for ref_name in referenced_names:
-                if refs_for_this >= MAX_REFS_PER_SYMBOL:
-                    break
                 targets = [t for t in filtered_names.get(ref_name, [])
-                           if t["id"] != source_id and t["kind"] in EDGE_TARGET_KINDS
+                           if t["id"] != source_id and (
+                               # A constructor — defined in its class, or only
+                               # declared there (a prototype) — is a target
+                               # where the name is called, never where it only
+                               # names a type: `Angle* p`, `const Angle& a`, a
+                               # field. That is a dependency on the class.
+                               (any(a is not None for a in arities_of.get(ref_name, ()))
+                                and t["kind"] in ("method", "prototype", "function", "template"))
+                               if _is_constructor(t, ref_name)
+                               else t["kind"] in _EDGE_TARGET_KINDS)
+                           and not _macro_misread(t)
                            and not (body is not None and t["body"] == body
                                     and t["file"] == source_file)]
+                targets = _without_forward_declarations(targets, source_file)
+                decided = None
+                if c_family and targets:
+                    forms, qualifiers = forms_of.get(ref_name, (set(), set()))
+                    targets, decided = _narrow_by_syntax(
+                        targets, ref_name, forms, qualifiers, source_scope, row["kind"],
+                        source_in_c=source_file.endswith(".c"),
+                        arities=arities_of.get(ref_name),
+                        receiver_types={var_types.get(v) for v in receivers_of.get(ref_name, ())}
+                        or None)
+                elif row["language"] == "python" and targets:
+                    targets, decided = _narrow_python_self_call(
+                        targets, ref_name, content, row["qualified_name"] or "", row["kind"])
                 if not targets:
                     continue
-                chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
+                if decided:
+                    chosen, resolution = targets, decided
+                else:
+                    chosen, resolution = _select_targets(targets, source_file, imported, ref_name)
+                # A name defined in many places, with nothing but the name to
+                # pick among them, would link each call to every one.
+                if resolution == "name_only" and len(chosen) > GRAPH_MAX_FANOUT:
+                    continue
                 for target in chosen:
                     confidence = _compute_confidence(source_file, target["file"])
                     # Skip very low confidence edges
@@ -2544,7 +3342,6 @@ class Indexer:
                         resolution=resolution,
                     ))
                     edge_count += 1
-                    refs_for_this += 1
 
         return edge_count
 

@@ -625,7 +625,8 @@ class WorkspaceDB:
         """
         assert self.conn is not None
         from .db import (
-            _IDENT_RE, RUNG_NONE, is_vendored_path, match_rung, split_identifier,
+            _IDENT_RE, RUNG_NONE, add_symbol_lines, is_vendored_path, match_rung,
+            split_identifier,
         )
 
         results: list[dict[str, Any]] = []
@@ -820,6 +821,14 @@ class WorkspaceDB:
                     seen_ids.add(key)
             except sqlite3.OperationalError as e:
                 self._fts_leg_failed(schema, "docs", e)
+
+            # Lines are read now, while the schema is attached: past
+            # MAX_ATTACH projects a later pass would attach them all again.
+            try:
+                add_symbol_lines(
+                    self.conn, [r for r in results if r["project"] == project_name], schema)
+            except sqlite3.DatabaseError:
+                pass  # a project that cannot be read keeps its hits, lineless
 
         # Collapse repeats. One row per (project, name, kind), carrying how many
         # it stands for. A human's eye skips a duplicate; an agent reads it as

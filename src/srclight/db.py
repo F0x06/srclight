@@ -1403,6 +1403,115 @@ class Database:
             "dimensions": model_row["dimensions"] if model_row else None,
         }
 
+    # --- Scan gaps ---
+
+    def set_unindexed_extensions(self, counts: dict[str, int]) -> None:
+        """Record the extensions the last index run walked past.
+
+        What an index never read is what its answers cannot mention, so the
+        record travels with the index rather than being recomputed by every
+        caller who thinks to doubt a result.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('unindexed_extensions', ?)",
+            (json.dumps(counts, sort_keys=True),),
+        )
+        self.conn.commit()
+
+    def get_unindexed_extensions(self) -> dict[str, int]:
+        """Extensions seen but not indexed, as {extension: file count}.
+
+        Empty when the last run indexed everything it walked, and also when
+        the index predates this record — an old index cannot claim a gap it
+        never measured.
+        """
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'unindexed_extensions'"
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def set_oversize_skipped(self, count: int) -> None:
+        """Record how many files the last run skipped for exceeding the size limit."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('oversize_skipped', ?)",
+            (str(int(count)),),
+        )
+        self.conn.commit()
+
+    def get_oversize_skipped(self) -> int:
+        """Files skipped for size by the last run. Zero when none were, or when unrecorded."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'oversize_skipped'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def set_failed_files(self, count: int) -> None:
+        """Record how many files the last run could not read or parse."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('failed_files', ?)",
+            (str(int(count)),),
+        )
+        self.conn.commit()
+
+    def get_failed_files(self) -> int:
+        """Files the last run failed on. Zero when none did, or when unrecorded."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'failed_files'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
+
+    def set_extension_overrides(self, overrides: dict[str, str]) -> None:
+        """Record the extra extensions this index reads, as {extension: language}.
+
+        Stored with the index because the git hooks reindex with no flags: an
+        override that lived only in the command line would be lost on the
+        next commit, and the files would quietly drop back out.
+        """
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('extension_overrides', ?)",
+            (json.dumps(overrides, sort_keys=True),),
+        )
+        self.conn.commit()
+
+    def get_extension_overrides(self) -> dict[str, str]:
+        """The extra extensions this index reads. Empty when none were declared."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'extension_overrides'"
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            data = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+
     # --- Index State ---
 
     def get_index_state(self, repo_root: str) -> dict | None:

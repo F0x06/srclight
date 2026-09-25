@@ -23,12 +23,21 @@ from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 from . import __version__
 from .db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
-from .extractors import DOCUMENT_EXTENSIONS, detect_document_language, get_registry
+from .extractors import (
+    DOCUMENT_EXTENSIONS,
+    detect_document_language,
+    get_registry,
+    unreadable_document_extensions,
+)
 from .languages import (
     LANGUAGES,
+    SKIP_LANGUAGE,
     LanguageConfig,
+    code_extensions,
     detect_language,
+    detect_language_by_filename,
     get_language,
+    normalize_extension,
 )
 
 logger = logging.getLogger("srclight.indexer")
@@ -143,6 +152,10 @@ class IndexConfig:
     max_file_size: int = MAX_FILE_SIZE
     max_doc_file_size: int = 50_000_000  # 50 MB for documents (PDF, DOCX, etc.)
     languages: list[str] | None = None  # None = all supported
+    # Extra extensions to read, as {extension: language}. None leaves the
+    # index's stored declaration alone (the flag-less reindex the git hooks
+    # run); an empty dict clears it.
+    extension_overrides: dict[str, str] | None = None
     embed_model: str | None = None  # e.g. "qwen3-embedding", "voyage-code-3"
     disable_embeddings: bool = False  # --no-embed: index without touching embeddings
 
@@ -185,6 +198,30 @@ def resolve_embed_model(db: Database, config: IndexConfig) -> str | None:
         return None
 
     return os.environ.get(EMBED_MODEL_ENV, "").strip() or None
+
+
+# Suffixes that never hold code srclight could index — configuration, data
+# and manifests. They are skipped like any unknown extension, but they are
+# not a GAP: every repo carries some, so counting them would leave the tally
+# non-empty everywhere, put the "not a whole-tree answer" warning on every
+# result, and bury the extensions that genuinely hold unread code. Files with
+# no suffix at all (LICENSE, Dockerfile, Makefile) are the same case.
+INERT_EXTENSIONS = frozenset({
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".lock",
+    ".txt", ".log", ".xml", ".properties", ".plist", ".editorconfig",
+})
+
+
+def _count_unindexed(counts: dict[str, int], path: Path) -> None:
+    """Tally one file the walk is about to skip, by extension.
+
+    Inert suffixes and suffixless files are not tallied — see
+    INERT_EXTENSIONS for why an over-eager tally is worse than none.
+    """
+    ext = path.suffix.lower()
+    if not ext or ext in INERT_EXTENSIONS:
+        return
+    counts[ext] = counts.get(ext, 0) + 1
 
 
 def _should_ignore(path: Path, root: Path, patterns: list[str]) -> bool:
@@ -819,12 +856,110 @@ class Indexer:
         self.config = config or IndexConfig()
         self._parsers: dict[str, Parser] = {}
         self._queries: dict[str, Query] = {}
+        self._ext_overrides: dict[str, str] = {}
 
         # Remove ignore patterns for extensions that have active extractors
         active_exts = _active_doc_extensions()
         self.config.ignore_patterns = [
             p for p in self.config.ignore_patterns if p not in active_exts
         ]
+
+    def _resolve_extension_overrides(self) -> dict[str, str]:
+        """Pick the extra-extension map for this run and keep it with the index.
+
+        An explicit map — including an empty one, which clears — wins and is
+        recorded; otherwise the recorded one is used, so a reindex that
+        passes no flags reads the same files as the run that declared them.
+        """
+        declared = self.config.extension_overrides
+        if declared is None:
+            return self.db.get_extension_overrides()
+        overrides = {normalize_extension(str(k)): str(v).lower() for k, v in declared.items()}
+        # Validated here, not only in the CLI: a language that does not exist
+        # is written into every FileRecord it touches, produces no symbols,
+        # and shows up in index_status as a language of the codebase.
+        unknown = {
+            lang for lang in overrides.values()
+            if lang != SKIP_LANGUAGE and lang not in LANGUAGES
+        }
+        if unknown:
+            raise ValueError(
+                f"Unknown language(s) in extension_overrides: {', '.join(sorted(unknown))}"
+            )
+        self.db.set_extension_overrides(overrides)
+        return overrides
+
+    def _ignored_only_by_its_own_extension(self, path: Path, root: Path,
+                                           patterns: list[str]) -> bool:
+        """True when a readable format is hidden by its own extension pattern alone.
+
+        Two cases reach here: a document format whose extractor is missing,
+        and a source extension that carries an ignore pattern anyway —
+        `*.cmake` sits in the default list next to the build artefacts, while
+        cmake is a language srclight parses. Both are unread by accident
+        rather than by intent.
+
+        It holds only if nothing ELSE excludes the file: a PDF or a generated
+        `.cmake` inside `build/`, `node_modules` or a vendored tree is
+        excluded on purpose whatever srclight can read, and reporting it
+        would put the warning back on every result.
+        """
+        ext = path.suffix.lower()
+        if ext not in code_extensions() and ext not in unreadable_document_extensions():
+            return False
+        return not _should_ignore(path, root, [p for p in patterns if p != f"*{ext}"])
+
+    def _grammar_missing(self, lang: str) -> bool:
+        """True when a source language has no usable tree-sitter grammar here.
+
+        Indexing such a file writes a row and extracts nothing, so it would
+        be reported as read while holding no searchable symbol — the same
+        false completeness in another guise. Document languages are parsed
+        by extractors, not grammars, so they never answer True.
+        """
+        if lang not in LANGUAGES:
+            return False
+        return self._get_parser(lang) is None
+
+    def _effective_ignore_patterns(self) -> list[str]:
+        """Ignore patterns minus those a declaration overrides.
+
+        `--ext .cmake=cmake` has to reach files that `*.cmake` would hide,
+        the way an installed extractor makes `*.pdf` stop applying —
+        otherwise the declaration is a silent no-op in one walk and works in
+        the other.
+        """
+        declared = {
+            f"*{ext}" for ext, lang in self._ext_overrides.items() if lang != SKIP_LANGUAGE
+        }
+        if not declared:
+            return self.config.ignore_patterns
+        return [p for p in self.config.ignore_patterns if p not in declared]
+
+    def _declared_unreadable(self, path: Path) -> bool:
+        """True when this index was told to leave the extension unread.
+
+        Scoped to the extension, so it never outranks a whole-filename rule:
+        `--ext .txt=skip` must not drop every CMakeLists.txt from the index.
+        """
+        if detect_language_by_filename(path):
+            return False
+        return self._ext_overrides.get(path.suffix.lower()) == SKIP_LANGUAGE
+
+    def _detect_language(self, path: Path) -> str | None:
+        """Detect a file's language, honouring this index's declared extensions.
+
+        A declaration is scoped to an extension, so it never outranks a rule
+        keyed on the whole filename: `--ext .txt=markdown` must not turn
+        every CMakeLists.txt in the tree into markdown.
+        """
+        by_name = detect_language_by_filename(path)
+        if by_name:
+            return by_name
+        override = self._ext_overrides.get(path.suffix.lower())
+        if override:
+            return override
+        return detect_language(path)
 
     def _get_parser(self, lang_name: str) -> Parser | None:
         if lang_name in self._parsers:
@@ -876,6 +1011,9 @@ class Indexer:
 
         logger.info("Indexing %s", root)
 
+        self._ext_overrides = self._resolve_extension_overrides()
+        ignore_patterns = self._effective_ignore_patterns()
+
         # Try to use git ls-files for .gitignore-aware file listing
         git_files = _git_tracked_files(root)
         use_git = git_files is not None
@@ -883,25 +1021,49 @@ class Indexer:
             logger.info("Using git ls-files (%d tracked files)", len(git_files))
 
         # Collect files to process
-        files_to_index: list[Path] = []
+        # (path, language): detected once, during collection. Detecting again
+        # in the processing loop reopened `.h` and `.inc` files and read them
+        # as they were THEN, not as the bytes that were hashed.
+        files_to_index: list[tuple[Path, str]] = []
+        # Extensions walked past, so the index can say what it never read
+        # instead of letting every answer imply it read everything.
+        unindexed_exts: dict[str, int] = {}
+        # Files srclight could read but refused on size — its own limit, not
+        # the project's choice, so it belongs in the gap report too.
+        oversize_skipped = 0
+        failed_files = 0
         if use_git:
             for rel in sorted(git_files):
                 path = root / rel
                 if not path.is_file():
                     continue
 
-                lang = detect_language(path)
-                is_doc = False
-                if lang is None:
-                    lang = detect_document_language(path.suffix)
-                    is_doc = True
-                if lang is None:
+                # git ls-files has already applied .gitignore, so this branch
+                # indexes what git tracks. The ignore patterns still decide
+                # what counts as a GAP: a tracked font or a vendored tree is
+                # excluded on purpose, and reporting it would leave the tally
+                # non-empty on every real repo — burying the extensions that
+                # are genuinely missing.
+                skipped = self._declared_unreadable(path)
+                if not skipped:
+                    lang = self._detect_language(path)
+                    is_doc = False
+                    if lang is None:
+                        lang = detect_document_language(path.suffix)
+                        is_doc = True
+                    skipped = lang is None
+                if skipped:
+                    if (not _should_ignore(path, root, ignore_patterns)
+                            or self._ignored_only_by_its_own_extension(
+                                path, root, ignore_patterns)):
+                        _count_unindexed(unindexed_exts, path)
                     continue
 
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
                 try:
                     if path.stat().st_size > size_limit:
                         stats.files_skipped += 1
+                        oversize_skipped += 1
                         continue
                 except OSError:
                     continue
@@ -909,32 +1071,57 @@ class Indexer:
                 if self.config.languages and lang not in self.config.languages:
                     continue
 
-                files_to_index.append(path)
+                if self._grammar_missing(lang):
+                    _count_unindexed(unindexed_exts, path)
+                    continue
+
+                files_to_index.append((path, lang))
                 stats.files_scanned += 1
         else:
             for path in sorted(root.rglob("*")):
                 if not path.is_file():
                     continue
-                if _should_ignore(path, root, self.config.ignore_patterns):
+                if _should_ignore(path, root, ignore_patterns):
+                    # Excluded on purpose — a gap only if the sole reason is
+                    # a pattern that is itself conditional on a missing
+                    # extractor.
+                    if self._ignored_only_by_its_own_extension(path, root, ignore_patterns):
+                        _count_unindexed(unindexed_exts, path)
                     continue
 
-                lang = detect_language(path)
+                if self._declared_unreadable(path):
+                    _count_unindexed(unindexed_exts, path)
+                    continue
+
+                lang = self._detect_language(path)
                 is_doc = False
                 if lang is None:
                     lang = detect_document_language(path.suffix)
                     is_doc = True
                 if lang is None:
+                    _count_unindexed(unindexed_exts, path)
                     continue
 
                 size_limit = self.config.max_doc_file_size if is_doc else self.config.max_file_size
-                if path.stat().st_size > size_limit:
-                    stats.files_skipped += 1
+                try:
+                    if path.stat().st_size > size_limit:
+                        stats.files_skipped += 1
+                        oversize_skipped += 1
+                        continue
+                except OSError:
+                    # Build output and editor temp files vanish mid-walk. The
+                    # git branch has always tolerated it; here it aborted the
+                    # run, and the coverage record with it.
                     continue
 
                 if self.config.languages and lang not in self.config.languages:
                     continue
 
-                files_to_index.append(path)
+                if self._grammar_missing(lang):
+                    _count_unindexed(unindexed_exts, path)
+                    continue
+
+                files_to_index.append((path, lang))
                 stats.files_scanned += 1
 
         # Track existing files for removal detection
@@ -942,7 +1129,7 @@ class Indexer:
         indexed_paths: set[str] = set()
 
         # Process each file
-        for i, path in enumerate(files_to_index):
+        for i, (path, lang) in enumerate(files_to_index):
             rel_path = str(path.relative_to(root))
             indexed_paths.add(rel_path)
 
@@ -956,12 +1143,6 @@ class Indexer:
                 # Skip if unchanged
                 if not self.db.file_needs_reindex(rel_path, file_hash):
                     stats.files_unchanged += 1
-                    continue
-
-                lang = detect_language(path)
-                if lang is None:
-                    lang = detect_document_language(path.suffix)
-                if lang is None:
                     continue
 
                 line_count = raw.count(b"\n") + (1 if raw and not raw.endswith(b"\n") else 0)
@@ -986,8 +1167,12 @@ class Indexer:
                 stats.files_indexed += 1
 
             except Exception as e:
+                # Unread is unread, whatever the reason: a file that raised
+                # here is absent from the index, and a coverage report that
+                # omitted it would call the scan complete without it.
                 logger.error("Error indexing %s: %s", path, e)
                 stats.errors += 1
+                failed_files += 1
 
         # Remove files that no longer exist
         for old_path in existing_paths - indexed_paths:
@@ -1047,6 +1232,12 @@ class Indexer:
         # took the parse work down with it if it failed. A second writer (the
         # git hook firing while the MCP server embeds) got 'database is locked'
         # and lost its own run: no busy_timeout is set.
+        # The coverage record goes with it, for the same reason: an index
+        # whose gaps changed would otherwise keep serving the old tally.
+        self.db.set_unindexed_extensions(unindexed_exts)
+        self.db.set_oversize_skipped(oversize_skipped)
+        self.db.set_failed_files(failed_files)
+
         self.db.commit()
 
         # Build embeddings (optional, only if a model is configured or known)
@@ -1066,6 +1257,11 @@ class Indexer:
         # reindex that only removed files, both land here.
         if (stats.files_indexed or stats.files_removed) and not stats.symbols_embedded:
             self._invalidate_sidecar()
+
+        # Every run walks the whole tree — the content-hash skip happens
+        # later — so this replaces the previous record rather than adding to
+        # it, and a gap that has been closed disappears.
+
 
         # Update index state
         git_head = _get_git_head(root)

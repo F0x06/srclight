@@ -2771,7 +2771,8 @@ class Indexer:
         stats = IndexStats()
         start = time.monotonic()
 
-        logger.info("Indexing %s", root)
+        # The CLI, which follows the phases, has already printed the root.
+        (logger.debug if on_phase else logger.info)("Indexing %s", root)
 
         self._ext_overrides = self._resolve_extension_overrides()
         ignore_patterns = self._effective_ignore_patterns()
@@ -2939,6 +2940,15 @@ class Indexer:
                 stats.errors += 1
                 failed_files += 1
 
+        # The progress line otherwise stays on the last file it showed, which
+        # says nothing about the pass: it ends on what the pass found.
+        if on_progress and files_to_index:
+            # The three add up to the files the pass went through.
+            failed = f", {stats.errors} failed" if stats.errors else ""
+            on_progress(f"done: {stats.files_indexed} indexed, "
+                        f"{stats.files_unchanged} unchanged{failed}",
+                        len(files_to_index), len(files_to_index))
+
         # Remove files that no longer exist
         for old_path in existing_paths - indexed_paths:
             file_rec = self.db.get_file(old_path)
@@ -2951,8 +2961,12 @@ class Indexer:
             if on_phase:
                 on_phase("Building the call graph")
             phase_start = time.monotonic()
-            stats.edges_created = self._build_edges(on_progress=on_progress)
-            stats.edges_created += self._build_inheritance_edges()
+            self._build_edges(on_progress=on_progress)
+            self._build_inheritance_edges()
+            # Their counts include the duplicates INSERT OR IGNORE drops; the
+            # graph is rebuilt whole, so the table holds exactly this run's.
+            stats.edges_created = self.db.conn.execute(
+                "SELECT COUNT(*) FROM symbol_edges").fetchone()[0]
             logger.info("Call graph: %d edges in %.0fs",
                         stats.edges_created, time.monotonic() - phase_start)
 
@@ -3031,7 +3045,15 @@ class Indexer:
                 on_phase("Embedding new and changed symbols")
             stats.symbols_embedded = self._build_embeddings(embed_model)
             if stats.symbols_embedded > 0:
-                logger.info("Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
+                # The CLI's summary says it too.
+                (logger.debug if on_phase else logger.info)(
+                    "Embedded %d symbols with %s", stats.symbols_embedded, embed_model)
+
+        # A phase of its own: folding the WAL back into index.db can take long
+        # on a large first index, and would otherwise be timed as part of
+        # whatever phase came last.
+        if on_phase:
+            on_phase("Saving the index")
 
         # Symbols moved and nothing was embedded: the sidecar now describes a
         # database that has changed, and symbols.id is a rowid reused after
@@ -3055,7 +3077,11 @@ class Indexer:
         self.db.commit()
         stats.elapsed_seconds = time.monotonic() - start
 
-        logger.info(
+        # A caller following the phases prints its own summary of the run,
+        # with these figures — both CLI index commands do — so they are only
+        # a debug line there. The MCP tool and the git hook have no other
+        # record of the run.
+        (logger.debug if on_phase else logger.info)(
             "Indexed %d files (%d symbols, %d edges) in %.2fs. %d unchanged, %d removed, %d errors.",
             stats.files_indexed, stats.symbols_extracted, stats.edges_created,
             stats.elapsed_seconds, stats.files_unchanged, stats.files_removed, stats.errors,
@@ -3713,7 +3739,7 @@ class Indexer:
         # Get symbols needing embeddings
         symbols = self.db.get_symbols_needing_embeddings(provider.name)
         if not symbols:
-            logger.debug("All symbols already embedded with %s", provider.name)
+            logger.info("No symbols to embed: all are embedded with %s", provider.name)
             return 0
 
         logger.info("Embedding %d symbols with %s...", len(symbols), provider.name)
@@ -3721,6 +3747,8 @@ class Indexer:
         embed_start = time.monotonic()
 
         def _on_progress(batch_num: int, total: int) -> None:
+            if total < 2:
+                return  # a single batch has no progress to report
             elapsed = time.monotonic() - embed_start
             rate = batch_num / elapsed if elapsed > 0 else 0
             remaining = (total - batch_num) / rate if rate > 0 else 0
@@ -3778,8 +3806,9 @@ class Indexer:
                     on_phase("Rebuilding the vector cache")
                 srclight_dir = self.config.root / ".srclight"
                 cache = VectorCache(srclight_dir)
+                # It logs what it built: every vector, not only the ones just
+                # embedded, and how many it reused.
                 cache.build_from_db(self.db.conn)
-                logger.info("Embedding sidecar built: %d vectors", len(results))
             except Exception as e:
                 logger.warning("Failed to build embedding sidecar: %s", e)
 

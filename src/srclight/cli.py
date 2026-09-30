@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -62,6 +64,12 @@ def _get_db_path(root: Path) -> Path:
     return new_path
 
 
+# Each line carries the time it was logged: an index run's phases take from
+# seconds to minutes, and the gap between two lines says which one was slow.
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_DATEFMT = "%H:%M:%S"
+
+
 @click.group()
 @click.version_option(version=__version__)
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
@@ -70,7 +78,8 @@ def main(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(levelname)s %(name)s: %(message)s",
+        format=LOG_FORMAT,
+        datefmt=LOG_DATEFMT,
         stream=sys.stderr,
     )
 
@@ -83,9 +92,15 @@ class _ProgressLine:
     instead of starting a line of its own, so the line is ended first.
     """
 
-    def __init__(self, indent: str, width: int):
+    # What runs before the first phase the indexer announces.
+    FIRST_PHASE = "Indexing files"
+
+    def __init__(self, indent: str, width: int, clock=time.monotonic):
         self.indent, self.width = indent, width
         self.open = False
+        self._clock = clock
+        # (name, start, end) of each phase; the current one has no end yet.
+        self.phases: list[list] = []
 
     def progress(self, file: str, current: int, total: int) -> None:
         pct = (current / total * 100) if total > 0 else 0
@@ -95,7 +110,25 @@ class _ProgressLine:
 
     def phase(self, name: str) -> None:
         self.close()
-        click.echo(f"{self.indent}{name}...")
+        self._next_phase(name)
+        # The time as log lines carry it (LOG_FORMAT), in the same column: the
+        # gap between two lines says how long a step took.
+        click.echo(f"{datetime.now():%H:%M:%S} {name}...")
+
+    def _next_phase(self, name: str | None) -> None:
+        now = self._clock()
+        if self.phases and self.phases[-1][2] is None:
+            self.phases[-1][2] = now
+        if name is not None:
+            self.phases.append([name, now, None])
+
+    def total(self) -> float:
+        """How long all the phases took together."""
+        return sum(seconds for _, seconds in self.durations())
+
+    def durations(self) -> list[tuple[str, float]]:
+        """How long each phase took, in order, the file scan first."""
+        return [(name, end - start) for name, start, end in self.phases if end is not None]
 
     def close(self) -> None:
         if self.open:
@@ -109,12 +142,20 @@ class _ProgressLine:
     def __enter__(self) -> _ProgressLine:
         for handler in logging.getLogger().handlers:
             handler.addFilter(self._before_log)
+        self.phase(self.FIRST_PHASE)
         return self
 
     def __exit__(self, *exc) -> None:
         for handler in logging.getLogger().handlers:
             handler.removeFilter(self._before_log)
+        self._next_phase(None)
         self.close()
+
+    def summary(self) -> list[str]:
+        """One line per phase for the run's summary: name and duration."""
+        steps = self.durations()
+        width = max((len(name) for name, _ in steps), default=0)
+        return [f"{self.indent}  {name:<{width}}  {seconds:6.1f}s" for name, seconds in steps]
 
 
 def parse_extension_overrides(values: tuple[str, ...]) -> dict[str, str]:
@@ -250,22 +291,30 @@ def index(path: str, db_path: str | None, embed_model: str | None, no_embed: boo
         stats = indexer.index(root, on_progress=line.progress, on_phase=line.phase)
 
     click.echo()
-    click.echo(f"  Files scanned:   {stats.files_scanned}")
-    click.echo(f"  Files indexed:   {stats.files_indexed}")
-    click.echo(f"  Files unchanged: {stats.files_unchanged}")
-    click.echo(f"  Files removed:   {stats.files_removed}")
-    click.echo(f"  Symbols found:   {stats.symbols_extracted}")
-    click.echo(f"  Errors:          {stats.errors}")
-    click.echo(f"  Time:            {stats.elapsed_seconds:.2f}s")
-
     db_stats = db.stats()
-    click.echo(f"  Database size:   {db_stats['db_size_mb']} MB")
+    # "Symbols extracted" counts the files indexed this run only; the index
+    # total is what the run left behind.
+    click.echo(f"  Files:       {stats.files_scanned} scanned, {stats.files_indexed} indexed, "
+               f"{stats.files_unchanged} unchanged, {stats.files_removed} removed, "
+               f"{stats.errors} errors")
+    click.echo(f"  Symbols:     {stats.symbols_extracted} extracted, "
+               f"{db_stats['symbols']} in the index")
+    # Any file indexed rebuilds the whole graph, even when it ends up empty.
+    rebuilt = ", call graph rebuilt this run" if stats.files_indexed else ""
+    click.echo(f"  Edges:       {db_stats['edges']} in the index{rebuilt}")
+    # Measured here, from the first phase to the end of the last: the
+    # indexer's own elapsed_seconds stops before its closing checkpoint,
+    # which the "Saving the index" phase below does include.
+    click.echo(f"  Time:        {line.total():.2f}s")
+    for step in line.summary():
+        click.echo(step)
+    click.echo(f"  Database:    {db_stats['db_size_mb']} MB")
 
     if resolved_model:
         emb_stats = db.embedding_stats()
-        click.echo(f"  Embedded now:    {stats.symbols_embedded}")
-        click.echo(f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
-                    f" ({emb_stats['coverage_pct']}%)")
+        click.echo(f"  Embeddings:  {stats.symbols_embedded} embedded now, "
+                   f"{emb_stats['embedded_symbols']}/{emb_stats['total_symbols']} "
+                   f"({emb_stats['coverage_pct']}%)")
 
     db.close()
 
@@ -695,10 +744,14 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None,
             with _ProgressLine("    ", 55) as line:
                 stats = indexer.index(root, on_progress=line.progress, on_phase=line.phase)
 
-            click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "
-                        f"{stats.files_unchanged} unchanged, {stats.elapsed_seconds:.1f}s")
-
+            # Every figure of the indexer's closing log line, which is only a
+            # debug line for a caller that prints its own summary.
             db_stats = db.stats()
+            click.echo(f"    {stats.files_scanned} files: {stats.files_indexed} indexed, "
+                       f"{stats.files_unchanged} unchanged, {stats.files_removed} removed, "
+                       f"{stats.errors} errors; {stats.symbols_extracted} symbols, "
+                       f"{db_stats['edges']} edges in the index, "
+                       f"{line.total():.1f}s")
             click.echo(f"    DB: {db_stats['db_size_mb']} MB")
         except Exception as e:
             click.echo(f"\n    ERROR: {e}", err=True)

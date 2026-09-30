@@ -285,6 +285,11 @@ CREATE TABLE IF NOT EXISTS symbol_embeddings (
 -- reuse the vectors it already holds.
 CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_stamp
     ON symbol_embeddings(embedded_at, model, dimensions);
+-- The hashes that say which symbols need embedding again, likewise readable
+-- without the blobs, and without the symbols' content stored before them.
+CREATE INDEX IF NOT EXISTS idx_symbol_embeddings_hash
+    ON symbol_embeddings(symbol_id, model, body_hash);
+CREATE INDEX IF NOT EXISTS idx_symbols_body_hash ON symbols(body_hash, file_id);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
@@ -1395,19 +1400,65 @@ class Database:
         )
 
     def get_symbols_needing_embeddings(self, model: str, limit: int = 100000) -> list[dict]:
-        """Get symbols that need embeddings (no embedding or body_hash changed)."""
+        """Get symbols that need embeddings (no embedding or body_hash changed).
+
+        Asked on every index run, and usually the answer is none. One query
+        joining symbols to their embeddings read `body_hash` from both
+        tables, where it is stored after the symbol's content and after the
+        embedding blob: every run walked all of both, gigabytes on a large
+        index, to find nothing. Two covering indexes hold the hashes, so the
+        comparison reads only them, and the details are fetched for the
+        symbols it finds — the first `limit` of them by id, as the scan in
+        rowid order gave them. The comparison is the join's, `!=` included,
+        so a hash missing on either side never counts as a change.
+
+        SQLite looks the embedding up by its primary key, whose row holds the
+        blob, unless told to use the index: INDEXED BY is only named once
+        both indexes exist, and a database that has not been through
+        initialize() since they were added is answered by the plain join.
+        """
         assert self.conn is not None
-        rows = self.conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.signature, s.doc_comment,
-                      s.content, s.body_hash, s.kind, f.path as file_path
-               FROM symbols s
-               JOIN files f ON s.file_id = f.id
-               LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?
-               WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash
-               LIMIT ?""",
-            (model, limit),
-        ).fetchall()
-        return [{k: row[k] for k in row.keys()} for row in rows]
+        present = {row[0] for row in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN "
+            "('idx_symbols_body_hash', 'idx_symbol_embeddings_hash')")}
+        hinted = len(present) == 2
+        # SQLite keeps only the first `limit` ids as it scans: a first run,
+        # or a new model, needs nearly every symbol of the index.
+        # The embedding is looked up in correlated subqueries, not joined:
+        # with planner statistics (ANALYZE) SQLite builds a Bloom filter for
+        # a join by scanning the joined table itself, blobs and all. There is
+        # at most one embedding per symbol (symbol_id is the primary key), so
+        # "none of this model, or one whose hash differs" is the LEFT JOIN's
+        # `e.symbol_id IS NULL OR e.body_hash != s.body_hash`, NULLs included.
+        # CROSS JOIN keeps the symbols' index the outer loop whatever the
+        # planner statistics say: SQLite never reorders it.
+        hint = "INDEXED BY idx_symbol_embeddings_hash" if hinted else ""
+        needed = [row[0] for row in self.conn.execute(
+            f"""SELECT s.id
+                FROM symbols s {'INDEXED BY idx_symbols_body_hash' if hinted else ''}
+                CROSS JOIN files f ON s.file_id = f.id
+                WHERE NOT EXISTS (SELECT 1 FROM symbol_embeddings e {hint}
+                                  WHERE e.symbol_id = s.id AND e.model = ?)
+                   OR EXISTS (SELECT 1 FROM symbol_embeddings e {hint}
+                              WHERE e.symbol_id = s.id AND e.model = ?
+                                AND e.body_hash != s.body_hash)
+                ORDER BY s.id
+                LIMIT ?""",
+            (model, model, limit))]
+        found: list[dict] = []
+        for start in range(0, len(needed), 500):
+            chunk = needed[start:start + 500]
+            rows = self.conn.execute(
+                f"""SELECT s.id, s.name, s.qualified_name, s.signature, s.doc_comment,
+                          s.content, s.body_hash, s.kind, f.path as file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE s.id IN ({','.join('?' * len(chunk))})
+                   ORDER BY s.id""",
+                chunk,
+            ).fetchall()
+            found.extend({k: row[k] for k in row.keys()} for row in rows)
+        return found
 
     def vector_search(self, query_embedding: bytes, dimensions: int,
                       limit: int = 10, kind: str | None = None,

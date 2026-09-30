@@ -1854,6 +1854,43 @@ class Database:
 
     # --- Communities ---
 
+    def community_row_counts(self) -> dict[str, int]:
+        """How many community memberships, execution flows and flow steps
+        are stored. Deleting a symbol deletes its rows in all three (ON
+        DELETE CASCADE), and nothing but a new detection puts them back."""
+        assert self.conn is not None
+        return {table: self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("symbol_communities", "execution_flows", "flow_steps")}
+
+    def get_communities_record(self) -> dict | None:
+        """The call graph fingerprint the stored communities and flows were
+        found from, and their row counts as stored."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'communities_state'"
+        ).fetchone()
+        try:
+            return json.loads(row[0]) if row else None
+        except (TypeError, ValueError):
+            return None
+
+    def set_communities_record(self, fingerprint: str) -> None:
+        """Record what the communities and flows just stored came from, with
+        their row counts: to be called once both are stored, never before."""
+        assert self.conn is not None
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_info (key, value) VALUES ('communities_state', ?)",
+            (json.dumps({"graph": fingerprint, **self.community_row_counts()}),),
+        )
+        self.conn.commit()
+
+    def communities_still_hold(self, fingerprint: str) -> bool:
+        """Whether the stored communities and flows were found from this very
+        graph and are still all there."""
+        record = self.get_communities_record()
+        return (isinstance(record, dict) and record.get("graph") == fingerprint
+                and all(record.get(k) == v for k, v in self.community_row_counts().items()))
+
     def store_communities(self, communities: list[dict]) -> None:
         """Store detected communities and their symbol memberships."""
         assert self.conn is not None

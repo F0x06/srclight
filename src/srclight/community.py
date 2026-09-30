@@ -11,6 +11,7 @@ References:
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import re
@@ -42,8 +43,65 @@ def _chunked_in_select(conn, columns: str, table: str, ids, *, chunk: int = _IN_
         )
 
 
-def detect_communities(db: Database) -> list[dict[str, Any]]:
+# Part of the call graph fingerprint: a change to how communities are found
+# or how execution flows are traced must not be skipped as "graph unchanged"
+# on an index that has not changed. Bump it with any change to either.
+_GRAPH_ANALYSIS_METHOD = "louvain-1.0-seed42-sorted/flows-20-8-3-50"
+
+
+def call_graph_edges(db: Database) -> list[tuple[int, int, int]]:
+    """The undirected call graph community detection works on, as sorted
+    (low id, high id, weight) triples: the weight counts the call edges
+    between the two symbols, in either direction.
+
+    Sorted, so the graph built from it is the same whatever order the edges
+    were written in. Louvain visits nodes in insertion order, and the order
+    of the edge rows changes from one index run to the next: built in that
+    order, the same graph gave different communities each time.
+    """
+    assert db.conn is not None
+    weights: Counter = Counter()
+    for src, tgt in db.conn.execute(
+            "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"):
+        weights[(src, tgt) if src <= tgt else (tgt, src)] += 1
+    return sorted((low, high, w) for (low, high), w in weights.items())
+
+
+def call_graph_fingerprint(db: Database) -> str:
+    """A digest of everything communities and execution flows are found
+    from: the calls, what the symbols making them are called, what they are
+    and where, and the methods.
+
+    The calls are counted with their direction: communities only need the
+    undirected graph, but execution flows follow calls from caller to
+    callee. And a symbol id is no identity on its own: a file re-parsed gets
+    its symbols re-inserted, and SQLite can hand the same ids back to
+    symbols that are renamed or moved. So each one's name, qualified name,
+    kind and file path are part of it.
+    """
+    import hashlib
+
+    assert db.conn is not None
+    calls = sorted(Counter(tuple(row) for row in db.conn.execute(
+        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'")).items())
+    nodes = sorted({n for (src, tgt), _ in calls for n in (src, tgt)})
+    symbols = sorted(tuple(row) for row in _chunked_in_select(
+        db.conn, "id, name, qualified_name, kind, file_id", "symbols", nodes))
+    paths = dict(tuple(row) for row in _chunked_in_select(
+        db.conn, "id, path", "files", {row[4] for row in symbols}))
+    digest = hashlib.blake2b(_GRAPH_ANALYSIS_METHOD.encode(), digest_size=16)
+    for (src, tgt), count in calls:
+        digest.update(b"%d>%d*%d;" % (src, tgt, count))
+    for sid, name, qualified, kind, file_id in symbols:
+        digest.update(repr((sid, name, qualified, kind, paths.get(file_id))).encode())
+    return digest.hexdigest()
+
+
+def detect_communities(db: Database,
+                       edges: list[tuple[int, int, int]] | None = None) -> list[dict[str, Any]]:
     """Detect communities in the call graph using Louvain algorithm.
+
+    `edges` is call_graph_edges(db), read here when not given.
 
     Returns list of community dicts with keys:
         id, label, symbol_count, cohesion, keywords, members
@@ -57,22 +115,14 @@ def detect_communities(db: Database) -> list[dict[str, Any]]:
 
     assert db.conn is not None
 
-    # Load call edges
-    rows = db.conn.execute(
-        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
-    ).fetchall()
-
-    if not rows:
+    if edges is None:
+        edges = call_graph_edges(db)
+    if not edges:
         return []
 
-    # Build undirected graph for community detection
+    # Build undirected graph for community detection, in one pass
     G = nx.Graph()
-    for row in rows:
-        src, tgt = row["source_id"], row["target_id"]
-        if G.has_edge(src, tgt):
-            G[src][tgt]["weight"] = G[src][tgt].get("weight", 1) + 1
-        else:
-            G.add_edge(src, tgt, weight=1)
+    G.add_weighted_edges_from(edges)
 
     if G.number_of_nodes() < 2:
         return []
@@ -97,10 +147,14 @@ def detect_communities(db: Database) -> list[dict[str, Any]]:
                 "kind": row["kind"],
             }
 
+    # Each name is split once, not once per use: the global frequencies, the
+    # label and the keywords all need it.
+    tokenize = functools.lru_cache(maxsize=None)(_tokenize_name)
+
     # Compute global token frequencies for TF-IDF labeling
     global_freq = Counter()
     for info in id_to_name.values():
-        tokens = _tokenize_name(info["name"] or "")
+        tokens = tokenize(info["name"] or "")
         global_freq.update(set(tokens))  # set() for document frequency
 
     # Build community results
@@ -111,8 +165,8 @@ def detect_communities(db: Database) -> list[dict[str, Any]]:
             continue
 
         names = [m["name"] for m in members if m["name"]]
-        label = _label_community(names, global_freq, len(partition))
-        keywords = _extract_keywords(names, global_freq, len(partition))
+        label = _label_community(names, global_freq, len(partition), tokenize)
+        keywords = _extract_keywords(names, global_freq, len(partition), tokenize)
 
         communities.append({
             "id": i,
@@ -149,12 +203,13 @@ def _tokenize_name(name: str) -> list[str]:
 
 
 def _label_community(
-    names: list[str], global_freq: Counter, n_communities: int,
+    names: list[str], global_freq: Counter, n_communities: int, tokenize=None,
 ) -> str:
     """Auto-label a community from its member symbol names using TF-IDF."""
+    tokenize = tokenize or _tokenize_name
     local_freq = Counter()
     for name in names:
-        tokens = _tokenize_name(name)
+        tokens = tokenize(name)
         local_freq.update(tokens)
 
     if not local_freq:
@@ -177,12 +232,13 @@ def _label_community(
 
 
 def _extract_keywords(
-    names: list[str], global_freq: Counter, n_communities: int,
+    names: list[str], global_freq: Counter, n_communities: int, tokenize=None,
 ) -> list[str]:
     """Extract top keywords for a community."""
+    tokenize = tokenize or _tokenize_name
     local_freq = Counter()
     for name in names:
-        tokens = _tokenize_name(name)
+        tokens = tokenize(name)
         local_freq.update(tokens)
 
     scored = {}
@@ -234,9 +290,15 @@ def trace_execution_flows(
     in_degree: dict[int, int] = {}
     out_degree: dict[int, int] = {}
 
-    rows = db.conn.execute(
-        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
-    ).fetchall()
+    # In a fixed order: each symbol's callees are followed in the order they
+    # are listed, and only the first few, so the order the edge rows came
+    # back in — which changes from one index run to the next — chose which.
+    rows = sorted(
+        db.conn.execute(
+            "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
+        ).fetchall(),
+        key=lambda row: (row[0], row[1]),
+    )
 
     # Load symbol info (kind, name, file_id) for all nodes in edges
     edge_node_ids: set[int] = set()
@@ -309,7 +371,8 @@ def trace_execution_flows(
 
         entry_scores.append((node_id, score))
 
-    entry_scores.sort(key=lambda x: x[1], reverse=True)
+    # Ties go to the lower symbol id, not to the order the nodes were met in.
+    entry_scores.sort(key=lambda x: (-x[1], x[0]))
     entry_points = [ep[0] for ep in entry_scores[:max_entry_points]]
 
     # BFS from each entry point (with global iteration cap)
